@@ -19,3 +19,15 @@ webview/vite.config.ts
 .gitignore
 tsconfig.json
 tslint.json
+# 只保留运行时必需的依赖：类型声明、打包工具、测试宿主都不进 VSIX
+node_modules/@types/**
+node_modules/@vscode/vsce/**
+node_modules/@vscode/vsce-sign/**
+node_modules/@vscode/vsce-sign-win32-x64/**
+node_modules/@vscode/test-electron/**
+# mediabunny 的入口全在 dist/，src/ 是源码副本（67 个文件 / 1.8 MB）
+node_modules/mediabunny/src/**
+# 文档与 sourcemap 对运行时无用
+node_modules/**/*.map
+node_modules/**/README.md
+node_modules/**/CHANGELOG.md

@@ -25,6 +25,7 @@
 - [数据存放位置](#数据存放位置)
 - [常见问题](#常见问题)
 - [从源码构建](#从源码构建)
+- [发布到 VS Code Marketplace](#发布到-vs-code-marketplace)
 - [开源协议](#开源协议)
 
 ---
@@ -522,6 +523,61 @@ code --uninstall-extension Alinn.wallpaper-studio
 Remove-Item -Recurse -Force "$env:USERPROFILE\.wallpaper-studio"
 Remove-Item -Recurse -Force "$env:APPDATA\Code\User\globalStorage\Alinn.wallpaper-studio"
 ```
+
+---
+
+## 发布到 VS Code Marketplace
+
+> 不需要公司、出版商资质或域名。个人开发者即可发布，唯一成本是时间。
+
+### 一次性准备
+
+**1. 创建 Publisher**
+
+打开 <https://marketplace.visualstudio.com/manage> → 用 Microsoft 账号登录 →
+**Create publisher**，ID 填 `Alinn`（必须与 `package.json` 的 `publisher` 一致）。
+"Publisher" 只是自取的名字，没有审核、不收费。
+
+**2. 生成 PAT**
+
+<https://dev.azure.com/_usersSettings/tokens> → **New Token**：
+
+| 项 | 值 |
+|---|---|
+| Organization | `All accessible organizations`（选单一组织会 403） |
+| Scopes | Show all scopes → **Marketplace** → **Manage** |
+
+### 发布
+
+```powershell
+cd "E:\Study\Vscode For Wallpaper Engine"
+
+.\node_modules\.bin\vsce.cmd login Alinn      # 粘贴 PAT，会存到 ~/.vsce
+.\node_modules\.bin\vsce.cmd publish          # 首次发布 1.0.0
+.\node_modules\.bin\vsce.cmd publish patch    # 之后升版本：1.0.0 → 1.0.1
+```
+
+`vscode:prepublish` 会自动执行 `clean → build:webview → compile`，无需手动构建。
+已有 VSIX 想直接上传：`vsce publish --packagePath .\wallpaper-studio-1.0.0.vsix`。
+
+### 不发布也能分发
+
+| 方式 | 说明 |
+|---|---|
+| VSIX | 分发 `wallpaper-studio-1.0.0.vsix`，对方执行 `code --install-extension xxx.vsix --force` |
+| GitHub Releases | 把 VSIX 挂到 Release，用户手动下载安装 |
+| Open VSX | `npx ovsx publish .\wallpaper-studio-1.0.0.vsix -p <token>`（VSCodium / Cursor） |
+
+### 常见报错
+
+| 报错 | 处理 |
+|---|---|
+| `Publisher 'Alinn' not found` | Publisher 未创建，或 ID 与 `package.json` 不一致 |
+| `401 / 403` | PAT 组织没选 `All accessible organizations`，或没勾 Marketplace → Manage |
+| `Icon file is not a PNG` | 图标必须是 128×128 PNG |
+| `Extension entrypoint is missing` | `.vscodeignore` 误排了 `out/` |
+
+> 本扩展会改写 VS Code 安装目录里的 workbench 文件，首次提交可能进入人工审核队列。
 
 ---
 

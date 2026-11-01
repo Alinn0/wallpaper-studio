@@ -3,9 +3,9 @@
   "displayName": "Wallpaper Studio",
   "description": "Render images, videos and Wallpaper Engine scene packages as your VS Code background. / 用图片、视频与 Wallpaper Engine 场景包作为 VS Code 背景。",
   "version": "1.0.0",
-  "publisher": "Alinn",
+  "publisher": "Alin0907",
   "engines": {
-    "vscode": "^1.38.0"
+    "vscode": "^1.60.0"
   },
   "one_title": true,
   "icon": "resources/wallpaper-studio.png",
