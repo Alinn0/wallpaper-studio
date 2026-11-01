@@ -1,0 +1,144 @@
+{
+  "name": "wallpaper-studio",
+  "displayName": "Wallpaper Studio",
+  "description": "Render images, videos and Wallpaper Engine scene packages as your VS Code background. / 用图片、视频与 Wallpaper Engine 场景包作为 VS Code 背景。",
+  "version": "1.0.0",
+  "publisher": "Alinn",
+  "engines": {
+    "vscode": "^1.38.0"
+  },
+  "one_title": true,
+  "icon": "resources/wallpaper-studio.png",
+  "galleryBanner": {
+    "color": "#2b2a6e",
+    "theme": "dark"
+  },
+  "categories": [
+    "Other"
+  ],
+  "keywords": [
+    "wallpaper",
+    "background",
+    "theme",
+    "video",
+    "wallpaper engine",
+    "scene"
+  ],
+  "activationEvents": [
+    "*"
+  ],
+  "license": "MIT",
+  "main": "./out/extension",
+  "extensionKind": [
+    "ui",
+    "workspace"
+  ],
+  "contributes": {
+    "commands": [
+      {
+        "command": "extension.wallpaperStudio.start",
+        "title": "Wallpaper Studio - start"
+      },
+      {
+        "command": "extension.wallpaperStudio.refresh",
+        "title": "Wallpaper Studio - refresh"
+      },
+      {
+        "command": "wallpaperStudio.refreshEntry",
+        "title": "刷新",
+        "icon": {
+          "light": "resources/light/refresh.svg",
+          "dark": "resources/dark/refresh.svg"
+        }
+      },
+      {
+        "command": "wallpaperStudio.home",
+        "title": "首页",
+        "icon": {
+          "light": "resources/light/home.svg",
+          "dark": "resources/dark/home.svg"
+        }
+      },
+      {
+        "command": "wallpaperStudio.switchMode",
+        "title": "配置",
+        "icon": "$(settings-gear)"
+      }
+    ],
+    "keybindings": [
+      {
+        "command": "extension.wallpaperStudio.refresh",
+        "key": "ctrl+shift+f7"
+      }
+    ],
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "wallpaperStudio-explorer",
+          "title": "Wallpaper Studio",
+          "icon": "resources/activity-bar.svg"
+        }
+      ]
+    },
+    "views": {
+      "wallpaperStudio-explorer": [
+        {
+          "id": "wallpaperStudio.studio",
+          "type": "webview",
+          "name": "Studio",
+          "when": "wallpaperStudio.mode == 'menu'"
+        }
+      ]
+    },
+    "menus": {
+      "view/title": [
+        {
+          "command": "wallpaperStudio.refreshEntry",
+          "when": "view == wallpaperStudio.studio",
+          "group": "navigation@0"
+        }
+      ]
+    }
+  },
+  "bugs": {
+    "url": "https://github.com/Alinn/wallpaper-studio/issues"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Alinn/wallpaper-studio.git"
+  },
+  "homepage": "https://github.com/Alinn/wallpaper-studio#readme",
+  "scripts": {
+    "vscode:prepublish": "npm run clean && npm run build:webview && npm run compile",
+    "clean": "node scripts/clean.js",
+    "vscode:uninstall": "node ./out/uninstall",
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./",
+    "package": "vsce package",
+    "build:webview": "cd webview && npm install --silent && npm run build",
+    "watch:webview": "cd webview && npm run dev",
+    "test:newfeatures": "npm run compile && node scripts/test-new-features.js",
+    "test:autorefresh": "npm run compile && node scripts/test-auto-refresh.js",
+    "test:unit": "npm run compile && node scripts/test-config-update.js && node scripts/test-auto-refresh.js && node scripts/test-source-isolation.js && node scripts/test-wallpaper-user.js && node scripts/test-soft-write.js && node scripts/test-new-features.js && node scripts/test-wallpaper-pkg.js",
+    "check": "tslint -p ./"
+  },
+  "devDependencies": {
+    "@types/fs-extra": "^11.0.4",
+    "@types/lockfile": "^1.0.4",
+    "@types/mocha": "^5.2.7",
+    "@types/node": "^22.9.0",
+    "@types/proper-lockfile": "^4.1.4",
+    "@types/vscode": "^1.30.0",
+    "@vscode/test-electron": "^2.3.2",
+    "@vscode/vsce": "^3.9.2",
+    "tslint": "^6.1.3",
+    "typescript": "^4.5.4"
+  },
+  "dependencies": {
+    "@vscode/sudo-prompt": "^9.3.2",
+    "async-mutex": "^0.5.0",
+    "fs-extra": "^11.2.0",
+    "proper-lockfile": "^4.1.2",
+    "webwallgl": "^3.0.0"
+  }
+}

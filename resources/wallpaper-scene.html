@@ -1,0 +1,48 @@
+<!doctype html>
+<html>
+<head>
+    <meta charset="utf-8">
+    <meta
+        http-equiv="Content-Security-Policy"
+        content="default-src 'none'; script-src 'unsafe-inline' 'unsafe-eval'; style-src 'unsafe-inline'; img-src 'self' vscode-file: data: blob:; media-src 'self' vscode-file: data: blob:; font-src 'self' vscode-file: data: blob:; connect-src vscode-file: data: blob:; worker-src 'self' vscode-file: blob:"
+    >
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <style>
+        html, body, #scene-host {
+            width: 100%;
+            height: 100%;
+            margin: 0;
+            overflow: hidden;
+            background: transparent;
+        }
+    </style>
+</head>
+<body>
+    <div id="scene-host"></div>
+    <script data-wallpaper-studio-scene>
+        (function() {
+            // 这份页面有两种宿主：workbench 里以 vscode-file: 顶层文档加载，和 Studio 面板
+            // 里作为 srcdoc 子框架加载。后者的 CSP 由父页继承而来，父页用 nonce 收口内联
+            // 脚本，所以这里读自己的 nonce 再原样传给动态创建的脚本 —— 否则那两个 run()
+            // 会被继承下来的策略拦掉。workbench 那份没有 nonce，取到空串时保持原样。
+            //
+            // 面板侧不按标签名找这处脚本，而是按上面那个 data- 标记补 nonce：面板 bundle
+            // 里出现字面量标签名会被扩展侧的 nonce 注入逻辑改坏。
+            const sceneNonce = document.currentScript ? document.currentScript.nonce : '';
+            function run(encoded) {
+                const binary = atob(encoded);
+                const bytes = Uint8Array.from(binary, function(character) {
+                    return character.charCodeAt(0);
+                });
+                const script = document.createElement('script');
+                if (sceneNonce) { script.nonce = sceneNonce; }
+                script.textContent = new TextDecoder().decode(bytes);
+                document.head.appendChild(script);
+                script.remove();
+            }
+            run('__WALLPAPER_STUDIO_WEBWALLGL_BASE64__');
+            run('__WALLPAPER_STUDIO_SCENE_BASE64__');
+        })();
+    </script>
+</body>
+</html>
