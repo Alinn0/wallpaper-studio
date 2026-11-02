@@ -51,7 +51,6 @@ import { ThumbnailStore } from './thumbnailStore';
 import { getAppConfig, onDidChangeSettings, resetSettings } from './settingsStore';
 
 const PUSH_DEBOUNCE_MS = 120;
-const THUMBNAIL_PUSH_BATCH_SIZE = 24;
 
 
 /** globalState keys the webview may write directly via `setGlobalState`. */
@@ -110,10 +109,6 @@ export class StudioViewProvider implements WebviewViewProvider {
     /** 面板上报的缩略图写入合并成一次落盘，避免拖动时反复写文件。 */
     private thumbnailWriteTimer?: ReturnType<typeof setTimeout>;
     private readonly pendingThumbnails = new Map<string, string>();
-    private wallpaperSyncPromise?: Promise<void>;
-    private wallpaperConfigCachedPath = '';
-    private wallpaperConfigMtimeMs?: number;
-    private wallpaperPlaylistLoaded = false;
 
     constructor(private readonly ctx: ExtensionContext) {
         // globalStorageUri 在真实环境一定存在；单测里的 mock context 可能没有，
@@ -150,6 +145,13 @@ export class StudioViewProvider implements WebviewViewProvider {
     public async prewarm(): Promise<void> {
         try {
             this.thumbnails.warm();
+            await this.syncWallpaperPlaylist();
+            const current = resolveCurrentImagePath(getAppConfig().get<string>('imagePath') || '');
+            if (current) {
+                // 触发 project.json 解析，把结果放进缓存；面板打开时就能直接取。
+                getWallpaperProjectProperties(current);
+                getWallpaperProjectDeclaration(current);
+            }
             this.ctx.globalState.get<string[]>('wallpaperStudioRecentImages', []);
         } catch (error) {
             console.warn('[WallpaperStudio] Prewarm skipped:', error);
@@ -373,15 +375,8 @@ export class StudioViewProvider implements WebviewViewProvider {
         if (!this.view) { return; }
         try {
             const data = await this.thumbnails.snapshot();
-            const entries = Object.entries(data);
-            for (let index = 0; index < entries.length; index += THUMBNAIL_PUSH_BATCH_SIZE) {
-                if (!this.view) { return; }
-                const batch = Object.fromEntries(entries.slice(index, index + THUMBNAIL_PUSH_BATCH_SIZE));
-                void this.view.webview.postMessage({ type: 'thumbnails', data: batch });
-                if (index + THUMBNAIL_PUSH_BATCH_SIZE < entries.length) {
-                    await new Promise<void>(resolve => setTimeout(resolve, 0));
-                }
-            }
+            if (!this.view || !Object.keys(data).length) { return; }
+            void this.view.webview.postMessage({ type: 'thumbnails', data });
         } catch (error) {
             console.warn('[WallpaperStudio] Failed to push thumbnails:', error);
         }
@@ -1004,38 +999,13 @@ export class StudioViewProvider implements WebviewViewProvider {
      *              （「重新读取配置」按钮用）。
      */
     private async syncWallpaperPlaylist(force = false): Promise<void> {
-        if (this.wallpaperSyncPromise) {
-            await this.wallpaperSyncPromise;
-            return;
-        }
-        this.wallpaperSyncPromise = this.syncWallpaperPlaylistInternal(force);
-        try {
-            await this.wallpaperSyncPromise;
-        } finally {
-            this.wallpaperSyncPromise = undefined;
-        }
-    }
-
-    private async syncWallpaperPlaylistInternal(force: boolean): Promise<void> {
         this.wallpaperNotice = '';
         try {
             if (!fs.existsSync(this.wallpaperConfigPath)) {
                 this.wallpaperEntries = [];
                 this.wallpaperUser = '';
-                this.wallpaperPlaylistLoaded = false;
                 return;
             }
-            const configStat = fs.statSync(this.wallpaperConfigPath);
-            if (
-                !force
-                && this.wallpaperPlaylistLoaded
-                && this.wallpaperConfigCachedPath === this.wallpaperConfigPath
-                && this.wallpaperConfigMtimeMs === configStat.mtimeMs
-            ) {
-                return;
-            }
-            this.wallpaperConfigCachedPath = this.wallpaperConfigPath;
-            this.wallpaperConfigMtimeMs = configStat.mtimeMs;
 
             const stored = this.ctx.globalState.get<string>(WALLPAPER_USER_KEY, '');
             const active = resolveActiveWallpaperUser(this.wallpaperConfigPath, stored);
@@ -1065,7 +1035,6 @@ export class StudioViewProvider implements WebviewViewProvider {
                 // 列表恢复了就允许下次空列表时重新提示。
                 this.notifiedWallpaperNotice = '';
             }
-            this.wallpaperPlaylistLoaded = true;
         } catch (error) {
             this.wallpaperEntries = [];
             this.wallpaperNotice = '读取 Wallpaper 播放列表失败，请检查 config.json 是否完整。';

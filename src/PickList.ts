@@ -23,7 +23,6 @@ import { hasCurrentImageRecord, resolveCurrentBlur, resolveCurrentImagePath, res
 import { getCandidatesForMode, getRandomCandidates, getSourceMode, setSourceMode } from './sourceMode';
 import { expandPathVariables, isSupportedMedia, pickRandomFromFolder } from './pathUtil';
 import { getAppConfig } from './settingsStore';
-import { softWriteOnce } from './backgroundSoftWrite';
 
 
 
@@ -781,7 +780,6 @@ export class PickList {
                 }
             }
             await setCurrentImagePath(nextPath, { persist });
-            await softWriteOnce(true);
             return true;
         }
         if (persist) {

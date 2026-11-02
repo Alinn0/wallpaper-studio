@@ -55,12 +55,12 @@ export function stopBackgroundSoftWrite(): void {
  *
  * 一次只跑一个：上一轮还没写完就跳过这一轮，避免 IO 排队。
  */
-export async function softWriteOnce(immediateCleanup = false): Promise<void> {
+export async function softWriteOnce(): Promise<void> {
     if (running) { return; }
     running = true;
     try {
         await syncSharedCss();
-        await pruneStaleSessionCss(immediateCleanup);
+        await pruneStaleSessionCss();
     } catch (error) {
         console.warn('[WallpaperStudio] Soft write skipped:', error);
     } finally {
@@ -118,7 +118,7 @@ async function syncSharedCss(): Promise<void> {
 }
 
 /** 删除过期的会话级 CSS 文件（保留当前窗口那一份）。 */
-async function pruneStaleSessionCss(immediateCleanup: boolean): Promise<void> {
+async function pruneStaleSessionCss(): Promise<void> {
     let names: string[];
     try {
         names = await fs.promises.readdir(WORKBENCH_DIR);
@@ -137,7 +137,7 @@ async function pruneStaleSessionCss(immediateCleanup: boolean): Promise<void> {
         const filePath = path.join(WORKBENCH_DIR, name);
         try {
             const stat = await fs.promises.stat(filePath);
-            if (!immediateCleanup && now - stat.mtimeMs < STALE_AFTER_MS) { continue; }
+            if (now - stat.mtimeMs < STALE_AFTER_MS) { continue; }
             await fs.promises.rm(filePath, { force: true });
         } catch {
             // 被占用 / 无权限：留给下一轮。

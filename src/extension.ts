@@ -124,8 +124,10 @@ export function activate(context: ExtensionContext) {
 
 	// New Vue-powered Studio webview (primary configuration UI)
 	const studioViewProvider = new StudioViewProvider(context);
-	// 扩展激活只预热轻量索引；完整播放列表在面板打开时加载，避免启动阶段阻塞。
-	void Promise.resolve().then(() => studioViewProvider.prewarm());
+	// 扩展激活即预热面板数据（播放列表、当前壁纸属性、缩略图索引），
+	// 用户点开视图时能立刻看到语言/当前壁纸/设置，不必再等一轮 IO。
+	// 缩略图本身仍按需懒加载，这里只读索引。
+	void studioViewProvider.prewarm();
 	context.subscriptions.push(window.registerWebviewViewProvider(
 		StudioViewProvider.viewType,
 		studioViewProvider,

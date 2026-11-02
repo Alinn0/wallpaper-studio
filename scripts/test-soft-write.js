@@ -96,12 +96,7 @@ async function main() {
     check('活跃的会话 CSS 保留', fs.existsSync(freshPath));
     check('当前窗口的会话 CSS 保留', fs.existsSync(sessionCssPath));
 
-    // 5. 背景切换后的立即同步会立刻清理其它会话文件，不等待过期时间
-    await softWrite.softWriteOnce(true);
-    check('立即清理会话 CSS', !fs.existsSync(freshPath));
-    check('立即清理仍保留当前会话', fs.existsSync(sessionCssPath));
-
-    // 6. 定时器可以启动/停止，重复启动幂等
+    // 5. 定时器可以启动/停止，重复启动幂等
     softWrite.startBackgroundSoftWrite();
     softWrite.startBackgroundSoftWrite();
     softWrite.stopBackgroundSoftWrite();
