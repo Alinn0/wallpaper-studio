@@ -8,7 +8,7 @@ import version from './version';
 import { SudoPromptHelper } from './SudoPromptHelper';
 import * as fse from 'fs-extra';
 import { getContext } from './global';
-import { getSessionHash, getWindowCssFileName, isPerWindowEnabled } from './windowBackground';
+import { getWorkspaceCssToken, getWindowCssFileName, isPerWindowEnabled } from './windowBackground';
 import { detectPatchStateFromFile, PatchState, BOOTSTRAP_VERSION } from './patchState';
 import { expandPathVariables, hasFileExtension, isVideoFile, pickRandomFromFolder } from './pathUtil';
 import {
@@ -106,7 +106,7 @@ async function getFilePermissionFor(filePath: string): Promise<void> {
 export function getActiveWindowCssFile(): { filePath: string; token: string } {
     const perWindow = isPerWindowEnabled();
     return perWindow
-        ? { filePath: path.join(selectedWorkbench.root, getWindowCssFileName()), token: getSessionHash() }
+        ? { filePath: path.join(selectedWorkbench.root, getWindowCssFileName()), token: getWorkspaceCssToken() }
         : { filePath: CUSTOM_CSS_FILE_PATH, token: SHARED_CSS_TOKEN };
 }
 
@@ -269,6 +269,7 @@ const CSS_FILE_PATH = path.join(selectedWorkbench.root, selectedWorkbench.css);
 const BAK_FILE_PATH = path.join(selectedWorkbench.root, selectedWorkbench.bak);
 const HTML_FILE_PATH = selectedWorkbench.html ? path.join(selectedWorkbench.root, selectedWorkbench.html) : undefined;
 const CUSTOM_CSS_FILE_NAME = 'css-wallpaper-studio.css';
+const BOOTSTRAP_CSS_FILE_NAME = 'css-wallpaper-studio-bootstrap.css';
 const CUSTOM_JS_FILE_NAME = 'js-wallpaper-studio.js';
 // 共用模式下随 reload trigger 一起下发的固定 token，注入端见到它就回到共享 CSS。
 const SHARED_CSS_TOKEN = 'shared';
@@ -451,8 +452,8 @@ export async function removeWallpaperStudioCssFiles(): Promise<void> {
     }
 }
 
-// 每个窗口会话都会新建一份 css-wallpaper-studio.<session>.css，而 session 在重载
-// 后就会变，旧文件不会再有人读。这里做 best-effort 回收：绝不提权、绝不弹窗，删不掉
+// 每个工作区会使用一份 css-wallpaper-studio.<workspace>.css。旧文件不会再有人读。
+// 这里做 best-effort 回收：绝不提权、绝不弹窗，删不掉
 // 就留给下次启动。按 mtime 判定过期，误删一个长期开着又没换过图的窗口的文件时，
 // 该窗口 loadCss 的 fetch 会失败并保留已在 DOM 里的样式，不会白屏。
 const WINDOW_CSS_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000;
@@ -802,9 +803,9 @@ export class FileDom {
             // exist keeps us forward/backward compatible across VSCode versions.
             let anyAdditionalChanged = false;
             for (const { jsPath, bakPath } of ADDITIONAL_BUNDLE_PATHS) {
-                if (!(await fse.pathExists(jsPath))) continue;
+                if (!(await fse.pathExists(jsPath))) { continue; }
                 const r = await this.patchOneJsFile(jsPath, bakPath, content, false);
-                if (r === 'patched') anyAdditionalChanged = true;
+                if (r === 'patched') { anyAdditionalChanged = true; }
                 if (r === 'failed') {
                     // Don't abort the whole install — the main window is already
                     // fine, the auxiliary one just won't have a background.
@@ -1042,7 +1043,7 @@ export class FileDom {
             // bundle on desktop). Missing files are tolerated — that just means
             // this VSCode build doesn't ship the auxiliary bundle.
             for (const { jsPath } of ADDITIONAL_BUNDLE_PATHS) {
-                if (!(await fse.pathExists(jsPath))) continue;
+                if (!(await fse.pathExists(jsPath))) { continue; }
                 try {
                     const raw = await this.getContent(jsPath);
                     const cleaned = this.clearCssContent(raw);
@@ -1063,7 +1064,7 @@ export class FileDom {
                 CUSTOM_SCENE_HTML_FILE_PATH,
                 CUSTOM_SCENE_JS_FILE_PATH
             ]) {
-                if (!(await fse.pathExists(generatedPath))) continue;
+                if (!(await fse.pathExists(generatedPath))) { continue; }
                 try {
                     await fse.remove(generatedPath);
                 } catch {
@@ -1216,6 +1217,10 @@ export class FileDom {
         try {
             if (!(await fse.pathExists(CUSTOM_CSS_FILE_PATH))) {
                 await this.writeWithPermission(CUSTOM_CSS_FILE_PATH, css);
+            }
+            const bootstrapCssPath = path.join(WORKBENCH_DIR, BOOTSTRAP_CSS_FILE_NAME);
+            if (!(await fse.pathExists(bootstrapCssPath))) {
+                await this.writeWithPermission(bootstrapCssPath, getCorruptionWarningCss());
             }
         } catch (error) {
             console.warn('[FileDom] Failed to seed shared CSS fallback:', error);
@@ -1808,12 +1813,12 @@ export class FileDom {
                     } catch (e) {
                         // ignore teardown failures
                     }
-                    try {
-                        const windows = [window].concat(Array.from(window.__wallpaperStudioAuxWindows || []));
-                        windows.forEach(targetWindow => disposeScene(targetWindow, true));
-                    } catch (e) {
-                        console.error('[WallpaperStudio] Scene dispose failed:', e);
-                    }
+                    // Keep the currently rendered scene alive while the dynamic
+                    // loader is replaced. The new loader will reuse it when the
+                    // CSS still points to the same scene, or dispose it after a
+                    // genuinely different background configuration is loaded.
+                    // Destroying it here causes a black frame during extension
+                    // activation even though the previous background is valid.
                     const assistant = document.getElementById('wallpaper-studio-assistant');
                     if (assistant) {
                         assistant.remove();
@@ -1976,10 +1981,14 @@ export class FileDom {
             };
             const cssUrl = resolveCssUrl();
             const cssBaseHref = getCssBaseHref(cssUrl);
+            const initialCssToken = 'bootstrap';
 
             function cssUrlForToken(token) {
                 // 'shared' = 共用模式：回到不带 session 后缀的共享 CSS。
                 if (!token || token === '${SHARED_CSS_TOKEN}') return cssUrl;
+                if (token === 'bootstrap') {
+                    return cssUrl.replace(cssFileName, '${this.escapeTemplateLiteral(BOOTSTRAP_CSS_FILE_NAME)}');
+                }
                 const windowFile = cssFileName.replace(/\\.css$/, '.' + token + '.css');
                 if (cssUrl.indexOf(cssFileName) !== -1) {
                     return cssUrl.split(cssFileName).join(windowFile);
@@ -1998,7 +2007,12 @@ export class FileDom {
             }
 
             function activeCssUrl() {
-                return window.__wallpaperStudioCssUrl || cssUrl;
+                if (window.__wallpaperStudioCssUrl) {
+                    return window.__wallpaperStudioCssUrl;
+                }
+                // In per-window mode, never flash the shared CSS from another
+                // window while the current session CSS is being prepared.
+                return perWindowEnabled ? cssUrlForToken(initialCssToken) : cssUrl;
             }
             
             ${videoSetup}
@@ -2134,7 +2148,9 @@ export class FileDom {
                 state.loading = true;
                 const generation = state.generation;
                 const token = state.token;
-                targetWindow.fetch(state.config.url, { cache: 'no-store' }).then(function(response) {
+                // Allow Electron to reuse the local package cache across
+                // workbench reloads instead of rereading the entire .pkg.
+                targetWindow.fetch(state.config.url).then(function(response) {
                     if (!response.ok) throw new Error('Scene package fetch failed: ' + response.status);
                     return response.arrayBuffer();
                 }).then(function(buffer) {
@@ -2384,6 +2400,7 @@ export class FileDom {
             let cssLoadInFlight = false;
             let cssReloadPending = false;
             let lastCssLoadAt = 0;
+            let forceCssReload = false;
 
             function withCacheBust(url) {
                 const sep = url.indexOf('?') === -1 ? '?' : '&';
@@ -2403,17 +2420,19 @@ export class FileDom {
                 try { return JSON.parse(unescaped); } catch (e) { return null; }
             }
 
-            function loadCss() {
+            function loadCss(forceFresh) {
                 // 拖动滑块时会有连续的变更通知：正在读的时候不能直接丢弃，
                 // 否则最后一次改动（用户实际停下的位置）可能永远不生效。
                 if (cssLoadInFlight) {
                     cssReloadPending = true;
+                    forceCssReload = forceCssReload || !!forceFresh;
                     return;
                 }
                 cssLoadInFlight = true;
                 lastCssLoadAt = Date.now();
                 const currentCssUrl = activeCssUrl();
-                const url = withCacheBust(currentCssUrl);
+                const url = forceFresh ? withCacheBust(currentCssUrl) : currentCssUrl;
+                const hadCss = !!lastCss;
                 fetch(url).then(r => r.text()).then(css => {
                     const resolvedCss = replaceRelativeTokens(css, getCssBaseHref(currentCssUrl) || cssBaseHref);
                     lastCss = resolvedCss;
@@ -2446,8 +2465,9 @@ export class FileDom {
                         lastSceneConfig = null;
                     }
 
-                    // A5: 换图前先预加载目标图片，避免首帧闪烁（最长等待 2s）
-                    return preloadBackgroundImage(resolvedCss);
+                    // The first background has no old layer to cross-fade from.
+                    // Do not make the initial render wait for the preload timeout.
+                    return hadCss ? preloadBackgroundImage(resolvedCss) : undefined;
                 }).then(() => {
                     applyToAll();
                 }).catch(e => console.error('[WallpaperStudio] Load error:', e))
@@ -2455,15 +2475,17 @@ export class FileDom {
                     cssLoadInFlight = false;
                     if (cssReloadPending) {
                         cssReloadPending = false;
-                        loadCss();
+                        const nextForceFresh = forceCssReload;
+                        forceCssReload = false;
+                        loadCss(nextForceFresh);
                     }
                 });
             }
 
-            function scheduleLoadCss(reason, delay) {
+            function scheduleLoadCss(reason, delay, forceFresh) {
                 registerTimer(setTimeout(() => {
                     try {
-                        loadCss();
+                        loadCss(!!forceFresh);
                     } catch (e) {
                         console.error('[WallpaperStudio] Scheduled load error (' + reason + '):', e);
                     }
@@ -2471,7 +2493,7 @@ export class FileDom {
             }
 
             // Initial load
-            scheduleLoadCss('initial', 0);
+            scheduleLoadCss('initial', 0, false);
 
             // 1. Event Hook: Listen for status bar message
             try {
@@ -2492,7 +2514,7 @@ export class FileDom {
                             if (wantsJsReload && bootstrap && typeof bootstrap.reload === 'function') {
                                 bootstrap.reload();
                             } else {
-                                scheduleLoadCss('statusbar', 0);
+                                scheduleLoadCss('statusbar', 0, true);
                                 scheduleLoadCss('statusbar-followup', 600);
                             }
                             return;
@@ -2610,7 +2632,7 @@ export class FileDom {
 
     // 转义模板字符串
     private escapeTemplateLiteral(value: string): string {
-        if (!value) return value;
+        if (!value) { return value; }
         return value
             .replace(/\\/g, '\\\\')
             .replace(/`/g, '\\`')

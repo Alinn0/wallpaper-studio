@@ -5,13 +5,12 @@ import { getContext, onDidChangeGlobalState } from './global';
 import { getAppConfig } from './settingsStore';
 import { readRuntimeState, updateRuntimeState } from './runtimeStore';
 
-const WINDOW_IMAGES_KEY = 'wallpaperStudio.windowImages';
 const WORKSPACE_IMAGES_KEY = 'wallpaperStudio.workspaceImages';
 // 全局兜底图。以前这个角色由 settings.json 的 wallpaperStudio.imagePath 承担，
 // 但那份值只在首次为空时写入、之后永久冻结，settings.json 会长期停留在用户第一次
 // 选的那张图上。改用独立的 globalState key 后，settings.json 只作为老用户的迁移
 // 兜底读取，扩展不再回写它。
-const GLOBAL_IMAGE_KEY = 'wallpaperStudio.globalImage';
+const NO_WORKSPACE_KEY = 'no-workspace';
 
 // 透明度/模糊度与背景图走同一套「窗口(session) → 工作区 → 兜底」的解析链，
 // 让不同工作区的窗口在 webview 里各自显示自己的数值。区别只在最后一层：
@@ -60,47 +59,53 @@ export function getSessionHash(): string {
 export function getWorkspaceKey(): string | undefined {
     const folder = workspace.workspaceFolders && workspace.workspaceFolders[0];
     if (!folder) {
-        return undefined;
+        return NO_WORKSPACE_KEY;
     }
+
     const normalized = path.normalize(folder.uri.fsPath).replace(/\\+/g, '/').replace(/\/+$/, '').toLowerCase();
     return shortHash(normalized);
 }
 
+/** Register the current folder even before it has a wallpaper selection. */
+export async function ensureWorkspaceRecord(): Promise<void> {
+    const folder = workspace.workspaceFolders && workspace.workspaceFolders[0];
+    const key = getWorkspaceKey();
+    if (!folder || !key) { return; }
+    const folderPath = path.normalize(folder.uri.fsPath);
+    await updateRuntimeState(runtime => {
+        if (runtime.workspacePaths[key] !== folderPath) {
+            runtime.workspacePaths[key] = folderPath;
+        }
+    });
+}
+
 export function getWindowCssFileName(): string {
-    return `css-wallpaper-studio.${getSessionHash()}.css`;
+    return `css-wallpaper-studio.${getWorkspaceCssToken()}.css`;
 }
 
-function readImageMap(key: string): Record<string, string> {
+/** CSS is shared by windows in the same folder and isolated across folders. */
+export function getWorkspaceCssToken(): string {
+    const workspaceKey = getWorkspaceKey();
+    return workspaceKey === NO_WORKSPACE_KEY ? 'noworkspace' : (workspaceKey || 'noworkspace');
+}
+
+function readImageMap(): Record<string, string> {
     const runtime = readRuntimeState();
-    if (key === WINDOW_IMAGES_KEY) { return { ...runtime.windowImages }; }
-    if (key === WORKSPACE_IMAGES_KEY) { return { ...runtime.workspaceImages }; }
-    return {};
-}
-
-function readGlobalImage(): string | undefined {
-    return readRuntimeState().globalImage;
+    return { ...runtime.workspaceImages };
 }
 
 export function hasCurrentImageRecord(): boolean {
     if (volatileImagePath !== undefined) {
         return true;
     }
-    // 共用模式下窗口/工作区级记录一律忽略，只认全局值。
-    if (isPerWindowEnabled()) {
-        const windowMap = readImageMap(WINDOW_IMAGES_KEY);
-        if (hasOwn(windowMap, getSessionHash())) {
+    const workspaceKey = getWorkspaceKey();
+    if (workspaceKey) {
+        const workspaceMap = readImageMap();
+        if (hasOwn(workspaceMap, workspaceKey)) {
             return true;
         }
-        const workspaceKey = getWorkspaceKey();
-        if (workspaceKey) {
-            const workspaceMap = readImageMap(WORKSPACE_IMAGES_KEY);
-            if (hasOwn(workspaceMap, workspaceKey)) {
-                return true;
-            }
-        }
     }
-    // 记录过空字符串也算"记录过"——用户显式关掉了背景，不该再被全局兜底复活。
-    return readGlobalImage() !== undefined;
+    return false;
 }
 
 /**
@@ -109,26 +114,14 @@ export function hasCurrentImageRecord(): boolean {
  * 只写内存的临时图），供判断"在线单图源记录是否仍是当前背景"这类场景使用。
  */
 export function getPersistedCurrentImage(globalFallback?: string): string {
-    if (isPerWindowEnabled()) {
-        const windowMap = readImageMap(WINDOW_IMAGES_KEY);
-        const sessionHash = getSessionHash();
-        if (hasOwn(windowMap, sessionHash)) {
-            return windowMap[sessionHash] || '';
-        }
-        const workspaceKey = getWorkspaceKey();
-        if (workspaceKey) {
-            const workspaceMap = readImageMap(WORKSPACE_IMAGES_KEY);
-            if (hasOwn(workspaceMap, workspaceKey)) {
-                return workspaceMap[workspaceKey] || '';
-            }
+    const workspaceKey = getWorkspaceKey();
+    if (workspaceKey) {
+        const workspaceMap = readImageMap();
+        if (hasOwn(workspaceMap, workspaceKey)) {
+            return workspaceMap[workspaceKey] || '';
         }
     }
-    const globalImage = readGlobalImage();
-    if (globalImage !== undefined) {
-        return globalImage;
-    }
-    // 老用户迁移路径：globalState 里还没有记录时，读 settings.json 的旧值。
-    return globalFallback || '';
+    return '';
 }
 
 export function resolveCurrentImagePath(globalFallback?: string): string {
@@ -139,52 +132,33 @@ export function resolveCurrentImagePath(globalFallback?: string): string {
 }
 
 export interface SetImageOptions {
-    /** false 表示只更新当前窗口的内存态(定时自动换图)，不写入 globalState。 */
+    /** false 表示只更新当前窗口的内存态，不写入 runtime.json。 */
     persist?: boolean;
 }
 
 /**
- * 把某个按窗口/工作区维度存储的值写入 runtime.json：当前窗口(session)记录 +
- * 当前工作区记录。共用模式(perWindowBackground=false)下不写窗口记录，
- * 由调用方走 settings.json 保持旧版全局共享行为。
- * @param globalKey 背景图需要额外维护一份"最后一张全局兜底"，透明度/模糊度不需要。
+ * 把值按当前打开的文件夹写入 runtime.json。无工作区时使用固定的
+ * no-workspace 键；同一文件夹的多个 VS Code 窗口因此共享同一张壁纸。
  */
 async function persistLevelValue(
-    windowKey: string,
     workspaceKey: string,
-    globalKey: string | undefined,
     value: string | number
 ): Promise<void> {
-    if (isPerWindowEnabled()) {
-        const sessionHash = getSessionHash();
-        const workspaceHash = getWorkspaceKey();
-        const saved = updateRuntimeState(runtime => {
-            const windowMap: Record<string, string | number> = windowKey === WINDOW_IMAGES_KEY
-                ? runtime.windowImages
-                : windowKey === WINDOW_OPACITY_KEY ? runtime.windowOpacity : runtime.windowBlur;
-            delete windowMap[sessionHash];
-            windowMap[sessionHash] = value;
-            const prunedWindowMap = pruneRecords(windowMap, sessionHash);
-            Object.keys(windowMap).forEach(key => {
-                if (!(key in prunedWindowMap)) { delete windowMap[key]; }
+    const workspaceHash = getWorkspaceKey();
+    const saved = await updateRuntimeState(runtime => {
+        const workspaceMap: Record<string, string | number> = workspaceKey === WORKSPACE_IMAGES_KEY
+            ? runtime.workspaceImages
+            : workspaceKey === WORKSPACE_OPACITY_KEY ? runtime.workspaceOpacity : runtime.workspaceBlur;
+        if (workspaceHash) {
+            delete workspaceMap[workspaceHash];
+            workspaceMap[workspaceHash] = value;
+            const prunedWorkspaceMap = pruneRecords(workspaceMap, workspaceHash);
+            Object.keys(workspaceMap).forEach(key => {
+                if (!(key in prunedWorkspaceMap)) { delete workspaceMap[key]; }
             });
-            const workspaceMap: Record<string, string | number> = workspaceKey === WORKSPACE_IMAGES_KEY
-                ? runtime.workspaceImages
-                : workspaceKey === WORKSPACE_OPACITY_KEY ? runtime.workspaceOpacity : runtime.workspaceBlur;
-            if (workspaceHash) {
-                delete workspaceMap[workspaceHash];
-                workspaceMap[workspaceHash] = value;
-                const prunedWorkspaceMap = pruneRecords(workspaceMap, workspaceHash);
-                Object.keys(workspaceMap).forEach(key => {
-                    if (!(key in prunedWorkspaceMap)) { delete workspaceMap[key]; }
-                });
-            }
-            if (globalKey === GLOBAL_IMAGE_KEY) { runtime.globalImage = String(value); }
-        });
-        if (!saved) { return; }
-    } else if (globalKey === GLOBAL_IMAGE_KEY) {
-        if (!updateRuntimeState(runtime => { runtime.globalImage = String(value); })) { return; }
-    }
+        }
+    });
+    if (!saved) { return; }
     onDidChangeGlobalState.fire();
 }
 
@@ -199,7 +173,7 @@ export async function setCurrentImagePath(imagePath: string, options: SetImageOp
     // 有显式持久化写入时，内存态的临时图就失去意义了。
     volatileImagePath = undefined;
 
-    await persistLevelValue(WINDOW_IMAGES_KEY, WORKSPACE_IMAGES_KEY, GLOBAL_IMAGE_KEY, value);
+    await persistLevelValue(WORKSPACE_IMAGES_KEY, value);
 }
 
 /**

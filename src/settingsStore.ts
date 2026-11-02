@@ -45,7 +45,7 @@ export const DEFAULT_SETTINGS: AppSettings = {
     perWindowBackground: true,
     randomImageFolder: '',
     autoStatus: false,
-    autoInterval: 10,
+    autoInterval: 0,
     sizeModel: 'cover',
     blendModel: 'auto',
     forceHttpsUpgrade: true,

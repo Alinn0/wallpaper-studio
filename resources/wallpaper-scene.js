@@ -214,8 +214,11 @@
             if (!api || typeof api.mount !== 'function' || typeof api.bytesSource !== 'function') {
                 throw new Error('WebWallGL renderer failed to initialize.');
             }
-            const fps = await detectRefreshRate();
-            if (currentGeneration !== generation || token !== message.token) { return; }
+            // Mount immediately at the safe upper bound. Refresh-rate sampling
+            // takes several animation frames; waiting for it here leaves the
+            // scene iframe black during every VS Code reload. Tune the running
+            // instance once the real display rate has been measured.
+            const refreshRatePromise = detectRefreshRate();
             const instance = await api.mount(host, {
                 source: api.bytesSource(
                     new Uint8Array(message.bytes),
@@ -226,7 +229,7 @@
                     'wallpaper-studio:' + message.key
                 ),
                 fit: 'cover',
-                fps: fps,
+                fps: 360,
                 volume: 0,
                 scripts: true,
                 properties: message.properties || {},
@@ -239,6 +242,11 @@
             }
 
             scene = instance;
+            void refreshRatePromise.then(function(fps) {
+                if (currentGeneration === generation && token === message.token && scene === instance) {
+                    try { instance.setFps(fps); } catch (e) { /* renderer may be closing */ }
+                }
+            });
             // 补发挂载前收到的指针，首帧就能带正确的视差/鼠标跟随角度。
             if (lastPointer && !lastPointer.leave) {
                 try { instance.pushPointer(lastPointer.u, lastPointer.v, lastPointer.buttons, lastPointer.mods); } catch (e) { /* 忽略 */ }

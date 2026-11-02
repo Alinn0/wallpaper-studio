@@ -20,7 +20,7 @@
             <div class="row">
                 <span class="row-label">{{ t('intervalSeconds') }}</span>
                 <el-input-number
-                    :model-value="Number(config.autoInterval ?? 10)"
+                    :model-value="Number(config.autoInterval ?? 0)"
                     :min="3"
                     :max="3600"
                     :step="1"

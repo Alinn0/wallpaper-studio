@@ -76,7 +76,7 @@ export const config = reactive<StudioConfig>({
     imageProperties: [],
     imageProject: undefined,
     autoStatus: false,
-    autoInterval: 10,
+    autoInterval: 0,
     sizeModel: 'cover',
     blendModel: 'auto',
     randomImageFolder: '',

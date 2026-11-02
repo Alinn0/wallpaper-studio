@@ -123,22 +123,35 @@ export class PickList {
      * 于是 Wallpaper 模式下定时器也会去 `randomImageFolder` 抽图 —— 表现为
      * "随机会随机到别的模式的壁纸"。
      */
-    public static autoUpdateBackground() {
+    public static async autoUpdateBackground(): Promise<boolean> {
         return PickList.randomForCurrentMode();
     }
 
-    /** 在当前模式内随机换一张（定时器与手动随机共用）。 */
-    private static randomForCurrentMode(): boolean {
+    /** 在当前模式内随机换一张（启动初始化、定时器与手动随机共用）。 */
+    private static async randomForCurrentMode(): Promise<boolean> {
         const config = getAppConfig();
         const current = resolveCurrentImagePath(config.get<string>('imagePath') || '');
         const candidates = getRandomCandidates(current);
         if (!candidates.length) { return false; }
         const next = candidates[Math.floor(Math.random() * candidates.length)];
-        void PickList.applyBackgroundPath(next, { persist: true, silent: true });
-        return true;
+        // Startup initialization, automatic rotation, and the random command
+        // all represent the current window's latest background. Persisting
+        // through setCurrentImagePath records it per window/workspace.
+        const applied = await PickList.applyBackgroundPath(next, { persist: true, silent: true });
+        return applied;
     }
 
-    public static randomUpdateBackground() {
+    /**
+     * Initialize a window that has no persisted background yet. Windows with
+     * an existing window/workspace/global record are restored by activation and
+     * must not be randomized here.
+     */
+    public static async initializeBackground(): Promise<boolean> {
+        if (hasCurrentImageRecord()) { return false; }
+        return PickList.randomForCurrentMode();
+    }
+
+    public static async randomUpdateBackground(): Promise<boolean> {
         const mode = getSourceMode();
         const candidates = getCandidatesForMode(mode);
         if (!candidates.length) {
@@ -179,7 +192,7 @@ export class PickList {
         return true;
     }
 
-    public static async applyCurrentBackground(): Promise<boolean> {
+    public static async applyCurrentBackground(forceReload: boolean = false): Promise<boolean> {
         const config = getAppConfig();
         const resolved = resolveCurrentImagePath(config.get<string>('imagePath') || '');
 
@@ -205,21 +218,37 @@ export class PickList {
         if (!resolved && !hasCurrentImageRecord()) {
             return false;
         }
-        if (resolved) {
-            await setCurrentImagePath(resolved);
-        }
         PickList.itemList = new PickList(config);
         const result = resolved
             ? await PickList.itemList.updateDom(false)
             : await PickList.itemList.updateDom(true);
         PickList.itemList = undefined;
+        if (forceReload && resolved) {
+            PickList.fireReloadTrigger('css', getActiveWindowCssFile().token);
+        }
         return result;
+    }
+
+    /** Reconcile the current window CSS immediately after the active folder changes. */
+    public static async applyCurrentWorkspaceBackground(): Promise<boolean> {
+        const config = getAppConfig();
+        const resolved = resolveCurrentImagePath(config.get<string>('imagePath') || '');
+        if (resolved || hasCurrentImageRecord()) {
+            return PickList.applyCurrentBackground(true);
+        }
+
+        const item = new PickList(config);
+        try {
+            return await item.updateDom(true);
+        } finally {
+            PickList.itemList = undefined;
+        }
     }
 
     public static startAutoRandomTask() {
         const config = getAppConfig();
         const autoStatus = config.get<boolean>('autoStatus');
-        const interval = config.get<number>('autoInterval', 10);
+        const interval = config.get<number>('autoInterval', 0);
 
         PickList.stopAutoRandomTask();
 
@@ -243,8 +272,13 @@ export class PickList {
                     PickList.logAutoRefresh(`Timer tick: refreshing in ${mode} mode (${candidates.length} candidates).`);
                     PickList.isAutoRunning = true;
                     try {
-                        await PickList.randomForCurrentMode();
-                        PickList.logAutoRefresh('Refresh cycle finished.');
+                        let applied = false;
+                        for (let attempt = 0; attempt < AUTO_IMAGE_ATTEMPTS && !applied; attempt++) {
+                            applied = await PickList.randomForCurrentMode();
+                        }
+                        PickList.logAutoRefresh(applied
+                            ? 'Refresh cycle finished.'
+                            : 'Refresh cycle failed after retries.');
                     } catch (err) {
                         PickList.logAutoRefresh('Refresh cycle failed; see extension host console for details.');
                         console.error(err);
@@ -274,7 +308,7 @@ export class PickList {
         }
     }
     public static gotoFilePath(path?: string) {
-        if (path == undefined) {
+        if (path === undefined) {
             return window.showWarningMessage('无效菜单');
         }
         const extensionUri = getContext().extensionUri ?? extensions.getExtension("Alinn.wallpaper-studio")?.extensionUri;
@@ -339,7 +373,7 @@ export class PickList {
         }
     }
     private gotoPath(path?: string) {
-        if (path == undefined) { return window.showWarningMessage('无效菜单'); }
+        if (path === undefined) { return window.showWarningMessage('无效菜单'); }
         env.openExternal(Uri.parse(path));
     }
     private dispose() {
@@ -709,6 +743,7 @@ export class PickList {
         this.pushRecentImage(path);
 
         await this.setConfigValue('imagePath', path, true, persist);
+        return true;
     }
 
     private async openFieldDialog(type: number) {
@@ -800,9 +835,22 @@ export class PickList {
         const isCurrentUpdate = () => seq === PickList._updateSeq;
         const dom = new FileDom(this.config, this.imgPath, this.opacity, this.sizeModel, this.blur, colorThemeKind, isCurrentUpdate, this.silentApply);
         let result = false;
+        let reloadTriggered = false;
 
         try {
             if (uninstall) {
+                // Clear the active CSS before touching runtime.json. Workspace
+                // switches must not wait on the runtime lock while the old
+                // folder's background remains visible.
+                result = await dom.clearBackground();
+                if (!result) {
+                    return false;
+                }
+                // Notify the injected loader before waiting for runtime.json.
+                // The CSS has already been replaced with the empty state, so
+                // the previous workspace is removed without lock-file latency.
+                PickList.fireReloadTrigger('css', dom.windowCssToken);
+                reloadTriggered = true;
                 await setCurrentImagePath('');
                 this.imgPath = '';
                 // 关背景必须把 settings.json 里的旧值一起清掉：它是新窗口/无工作区
@@ -812,7 +860,6 @@ export class PickList {
                     await this.config.update('imagePath', '', ConfigurationTarget.Global);
                     this.config = getAppConfig();
                 }
-                result = await dom.clearBackground();
             } else {
                 result = await dom.install();
             }
@@ -828,7 +875,13 @@ export class PickList {
                         this.quickPick.hide();
                     }
                     const didChangeAssets = uninstall || dom.didUpdateCss || dom.didUpdateDynamicJs;
-                    PickList.fireReloadTrigger(dom.didUpdateDynamicJs ? 'js' : 'css', dom.windowCssToken);
+                    // Startup restoration often finds that the injected loader is
+                    // already showing the exact CSS and runtime assets on disk.
+                    // Do not reload the live background in that case: re-reading
+                    // the CSS would briefly remove the scene/video layer.
+                    if (didChangeAssets && !reloadTriggered) {
+                        PickList.fireReloadTrigger(dom.didUpdateDynamicJs ? 'js' : 'css', dom.windowCssToken);
+                    }
 
                     setTimeout(() => {
                         if (didChangeAssets) {

@@ -2,13 +2,13 @@ import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
 import { getContext } from './global';
+import * as lockfile from 'proper-lockfile';
 
 export const RUNTIME_FILE = path.join(os.homedir(), '.wallpaper-studio', 'runtime.json');
 
 export interface RuntimeState {
     version: number;
-    globalImage?: string;
-    windowImages: Record<string, string>;
+    workspacePaths: Record<string, string>;
     workspaceImages: Record<string, string>;
     windowOpacity: Record<string, number>;
     workspaceOpacity: Record<string, number>;
@@ -18,8 +18,7 @@ export interface RuntimeState {
 
 const DEFAULT_RUNTIME: RuntimeState = {
     version: 1,
-    globalImage: undefined,
-    windowImages: {},
+    workspacePaths: {},
     workspaceImages: {},
     windowOpacity: {},
     workspaceOpacity: {},
@@ -52,8 +51,7 @@ function normalize(value: unknown): RuntimeState {
     const source = isRecord(value) ? value : {};
     return {
         version: 1,
-        globalImage: typeof source.globalImage === 'string' ? source.globalImage : undefined,
-        windowImages: stringMap(source.windowImages),
+        workspacePaths: stringMap(source.workspacePaths),
         workspaceImages: stringMap(source.workspaceImages),
         windowOpacity: numberMap(source.windowOpacity),
         workspaceOpacity: numberMap(source.workspaceOpacity),
@@ -73,9 +71,8 @@ function readDisk(): RuntimeState | null {
 function readLegacyState(): RuntimeState {
     const globalState = getContext().globalState;
     return normalize({
-        globalImage: globalState.get<string>('wallpaperStudio.globalImage'),
-        windowImages: globalState.get<Record<string, string>>('wallpaperStudio.windowImages', {}),
         workspaceImages: globalState.get<Record<string, string>>('wallpaperStudio.workspaceImages', {}),
+        workspacePaths: globalState.get<Record<string, string>>('wallpaperStudio.workspacePaths', {}),
         windowOpacity: globalState.get<Record<string, number>>('wallpaperStudio.windowOpacity', {}),
         workspaceOpacity: globalState.get<Record<string, number>>('wallpaperStudio.workspaceOpacity', {}),
         windowBlur: globalState.get<Record<string, number>>('wallpaperStudio.windowBlur', {}),
@@ -121,15 +118,65 @@ export function readRuntimeState(): RuntimeState {
 }
 
 /** Mutate and persist runtime state. Failed writes are not reflected in the cache. */
-export function updateRuntimeState(mutator: (state: RuntimeState) => void): boolean {
+export async function updateRuntimeState(mutator: (state: RuntimeState) => void): Promise<boolean> {
     const next = readRuntimeState();
     mutator(next);
-    if (!persist(next)) { return false; }
-    cache = next;
-    return true;
+    try {
+        fs.mkdirSync(path.dirname(RUNTIME_FILE), { recursive: true });
+        if (!fs.existsSync(RUNTIME_FILE)) {
+            fs.writeFileSync(RUNTIME_FILE, JSON.stringify(DEFAULT_RUNTIME, null, 2), 'utf8');
+        }
+        const release = await lockfile.lock(RUNTIME_FILE, {
+            retries: { retries: 8, minTimeout: 25, maxTimeout: 250 },
+            stale: 5000
+        });
+        try {
+            const latest = readDisk() || DEFAULT_RUNTIME;
+            mutator(latest);
+            if (!persist(latest)) { return false; }
+            cache = latest;
+            return true;
+        } finally {
+            await release();
+        }
+    } catch (error) {
+        console.warn('[WallpaperStudio] Failed to lock runtime state:', error);
+        return false;
+    }
 }
 
-export function clearRuntimeState(): boolean {
+export async function clearRuntimeState(): Promise<boolean> {
     cache = normalize(DEFAULT_RUNTIME);
-    return persist(cache);
+    return updateRuntimeState(state => {
+        Object.assign(state, normalize(DEFAULT_RUNTIME));
+    });
+}
+
+/** Remove records written by versions that used global/session-scoped images. */
+export async function clearLegacyImageRecords(): Promise<void> {
+    const state = getContext().globalState;
+    for (const key of [
+        'wallpaperStudio.globalImage',
+        'wallpaperStudio.windowImages',
+        'wallpaperStudio.workspaceImages'
+    ]) {
+        if (state.get<unknown>(key) !== undefined) {
+            await state.update(key, undefined);
+        }
+    }
+
+}
+
+/** Remove workspace image entries that have no folder metadata in the new format. */
+export async function pruneOrphanedWorkspaceRecords(): Promise<void> {
+    await updateRuntimeState(runtime => {
+        if (!Object.keys(runtime.workspacePaths).length) {
+            return;
+        }
+        for (const key of Object.keys(runtime.workspaceImages)) {
+            if (key !== 'no-workspace' && !Object.prototype.hasOwnProperty.call(runtime.workspacePaths, key)) {
+                delete runtime.workspaceImages[key];
+            }
+        }
+    });
 }

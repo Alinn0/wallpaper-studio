@@ -154,14 +154,8 @@ export class StudioViewProvider implements WebviewViewProvider {
     public async prewarm(): Promise<void> {
         try {
             this.thumbnails.warm();
-            await this.syncWallpaperPlaylist();
-            const current = resolveCurrentImagePath(getAppConfig().get<string>('imagePath') || '');
-            if (current) {
-                // 触发 project.json 解析，把结果放进缓存；面板打开时就能直接取。
-                getWallpaperProjectProperties(current);
-                getWallpaperProjectDeclaration(current);
-            }
-            this.ctx.globalState.get<string[]>('wallpaperStudioRecentImages', []);
+            // Gallery data is loaded when the gallery tab is requested. Keep
+            // extension activation focused on restoring the live background.
         } catch (error) {
             console.warn('[WallpaperStudio] Prewarm skipped:', error);
         }
@@ -359,7 +353,7 @@ export class StudioViewProvider implements WebviewViewProvider {
                         })
                         : undefined,
                     autoStatus: cfg.get('autoStatus') ?? false,
-                    autoInterval: cfg.get('autoInterval') ?? 10,
+                    autoInterval: cfg.get('autoInterval') ?? 0,
                     sizeModel: cfg.get('sizeModel') ?? 'cover',
                     blendModel: cfg.get('blendModel') ?? 'auto',
                     randomImageFolder: cfg.get('randomImageFolder') ?? '',
@@ -910,6 +904,7 @@ export class StudioViewProvider implements WebviewViewProvider {
             'wallpaperStudioSingleImageSource',
             'wallpaperStudio.windowImages',
             'wallpaperStudio.workspaceImages',
+            'wallpaperStudio.workspacePaths',
             'wallpaperStudio.globalImage',
             'wallpaperStudio.windowOpacity',
             'wallpaperStudio.workspaceOpacity',

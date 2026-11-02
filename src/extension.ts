@@ -8,6 +8,7 @@
 import {
 	commands,
 	window,
+	workspace,
 	Extension,
 	extensions,
 	ExtensionContext,
@@ -19,12 +20,20 @@ import { PickList } from './PickList';
 import { setContext } from './global';
 import { CUSTOM_JS_FILE_PATH, collectStaleWindowCssFiles, detectPatchState } from './FileDom';
 import { StudioViewProvider } from './StudioViewProvider';
-import { hasCurrentImageRecord, resolveCurrentImagePath, setCurrentBlur, setCurrentOpacity } from './windowBackground';
+import { ensureWorkspaceRecord, hasCurrentImageRecord, resolveCurrentImagePath, setCurrentBlur, setCurrentOpacity } from './windowBackground';
 import { getAppConfig, onDidChangeSettings } from './settingsStore';
+import { clearLegacyImageRecords, pruneOrphanedWorkspaceRecords } from './runtimeStore';
 
 
 export function activate(context: ExtensionContext) {
 	setContext(context);
+	void (async () => {
+		await clearLegacyImageRecords();
+		await ensureWorkspaceRecord();
+		await pruneOrphanedWorkspaceRecords();
+	})().catch(error => {
+		console.warn('[WallpaperStudio] Failed to initialize workspace background state:', error);
+	});
 	// 创建底部按钮 - 背景图片配置
 	let backImgBtn = window.createStatusBarItem(StatusBarAlignment.Right, -999);
 	backImgBtn.text = '$(file-media)';
@@ -54,7 +63,7 @@ export function activate(context: ExtensionContext) {
 
 			if (hasImage && loaderMissing) {
 				try {
-					await PickList.applyCurrentBackground();
+					await PickList.applyCurrentBackground(true);
 				} catch (error) {
 					console.warn('[WallpaperStudio] failed to restore missing loader:', error);
 				}
@@ -75,7 +84,12 @@ export function activate(context: ExtensionContext) {
 				});
 			} else {
 				if (hasImage) {
-					await PickList.applyCurrentBackground();
+					await PickList.applyCurrentBackground(true);
+				} else {
+					// Only the first window without any persisted background gets
+					// an initial random wallpaper. Existing window/workspace/global
+					// records are restored above and are never randomized on startup.
+					void PickList.initializeBackground();
 				}
 			}
 		}
@@ -103,8 +117,18 @@ export function activate(context: ExtensionContext) {
 			void PickList.applyCurrentBackground();
 		}
 	}));
+	if (workspace.onDidChangeWorkspaceFolders) {
+		context.subscriptions.push(workspace.onDidChangeWorkspaceFolders(() => {
+			void (async () => {
+				await PickList.applyCurrentWorkspaceBackground();
+				await ensureWorkspaceRecord();
+			})().catch(error => {
+				console.error('[WallpaperStudio] Failed to apply workspace background:', error);
+			});
+		}));
+	}
 
-	let randomCommand = commands.registerCommand('extension.wallpaperStudio.refresh', () => { PickList.randomUpdateBackground(); });
+	let randomCommand = commands.registerCommand('extension.wallpaperStudio.refresh', () => { void PickList.randomUpdateBackground(); });
 	let startCommand = commands.registerCommand('extension.wallpaperStudio.start', () => { 
 		commands.executeCommand('setContext', 'wallpaperStudio.mode', 'menu');
 		commands.executeCommand('workbench.view.extension.wallpaperStudio-explorer');
