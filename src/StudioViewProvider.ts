@@ -111,8 +111,6 @@ export class StudioViewProvider implements WebviewViewProvider {
     private wallpaperSyncPromise?: Promise<void>;
     /** 图库页按需加载；首页首屏不发送大量列表数据。 */
     private galleryRequested = false;
-    /** 播放列表预热完成后可直接推送，不必等用户先打开图库页。 */
-    private wallpaperPlaylistReady = false;
     /** 上次推送给面板的背景路径，用来判断"是否换壁纸了"，从而跳过防抖立刻推送。 */
     private lastPushedImagePath = '';
     /** 缩略图持久化（跨 VS Code 重启复用，避免重新渲染首帧）。 */
@@ -377,7 +375,9 @@ export class StudioViewProvider implements WebviewViewProvider {
                     wallpaperConfigPath: this.wallpaperConfigPath,
                     // 播放列表为空的原因（只在 wallpaper 模式有意义）。
                     wallpaperNotice: wallpaperMode ? this.wallpaperNotice : '',
-                    wallpaperPlaylist: (this.galleryRequested || this.wallpaperPlaylistReady) ? this.wallpaperEntries.map(entry => ({
+                    // 首页不需要完整播放列表。只在用户打开图库后构造 URI、属性和媒体信息，
+                    // 避免首屏把几百个项目交给 Webview 的 Vue 响应式系统。
+                    wallpaperPlaylist: this.galleryRequested ? this.wallpaperEntries.map(entry => ({
                         ...entry,
                         preview: entry.preview ? this.toWebviewUri(entry.preview) : '',
                         mediaSource: this.toWebviewUri(entry.path),
@@ -1045,12 +1045,10 @@ export class StudioViewProvider implements WebviewViewProvider {
 
     private async syncWallpaperPlaylistImpl(force = false): Promise<void> {
         this.wallpaperNotice = '';
-        this.wallpaperPlaylistReady = false;
         try {
             if (!fs.existsSync(this.wallpaperConfigPath)) {
                 this.wallpaperEntries = [];
                 this.wallpaperUser = '';
-                this.wallpaperPlaylistReady = true;
                 return;
             }
 
@@ -1082,11 +1080,9 @@ export class StudioViewProvider implements WebviewViewProvider {
                 // 列表恢复了就允许下次空列表时重新提示。
                 this.notifiedWallpaperNotice = '';
             }
-            this.wallpaperPlaylistReady = true;
         } catch (error) {
             this.wallpaperEntries = [];
             this.wallpaperNotice = '读取 Wallpaper 播放列表失败，请检查 config.json 是否完整。';
-            this.wallpaperPlaylistReady = true;
             console.error('[WallpaperStudio] Failed to sync Wallpaper Engine playlist:', error);
         }
     }
