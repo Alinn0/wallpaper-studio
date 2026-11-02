@@ -18,7 +18,6 @@ import * as fs from 'fs';
 import { PickList } from './PickList';
 import { setContext } from './global';
 import { CUSTOM_JS_FILE_PATH, collectStaleWindowCssFiles, detectPatchState } from './FileDom';
-import { startBackgroundSoftWrite, stopBackgroundSoftWrite } from './backgroundSoftWrite';
 import { StudioViewProvider } from './StudioViewProvider';
 import { hasCurrentImageRecord, resolveCurrentImagePath, setCurrentBlur, setCurrentOpacity } from './windowBackground';
 import { getAppConfig, onDidChangeSettings } from './settingsStore';
@@ -89,10 +88,6 @@ export function activate(context: ExtensionContext) {
 
 	// 回收历史窗口会话遗留的 CSS 文件，不阻塞启动
 	void collectStaleWindowCssFiles();
-
-	// 软写入保活：定期把当前壁纸同步到共享 CSS，并清理过期会话文件，
-	// 这样下次打开 VS Code 立刻就有背景，目录也不会越堆越大。
-	startBackgroundSoftWrite();
 
 	// 收敛在线图片缓存目录：无扩展名在线源每次换图都会新增缓存文件，长期自动换图
 	// 会让 images/ 无限增长（#233）。启动时清一次超过上限的最旧文件，不阻塞启动。
@@ -267,5 +262,4 @@ async function promptRestartWindow(): Promise<void> {
 // this method is called when your extension is deactivated
 export function deactivate() {
 	PickList.stopAutoRandomTask();
-	stopBackgroundSoftWrite();
 }

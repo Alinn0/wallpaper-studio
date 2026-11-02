@@ -49,6 +49,11 @@ import {
 } from './sourceMode';
 import { ThumbnailStore } from './thumbnailStore';
 import { getAppConfig, onDidChangeSettings, resetSettings } from './settingsStore';
+import { isWebviewMessage, WebviewMessage } from './webviewProtocol';
+import { createSceneRenderConfig } from './sceneRender';
+import { resolveBlendModeValue } from './backgroundCss';
+import { isPathInsideFolder, normalizeComparablePath } from './pathComparison';
+import { clearRuntimeState } from './runtimeStore';
 
 const PUSH_DEBOUNCE_MS = 120;
 
@@ -102,6 +107,12 @@ export class StudioViewProvider implements WebviewViewProvider {
     private wallpaperNotice = '';
     /** 已经弹过的提示文案，避免每次 pushState 都重复弹 toast。 */
     private notifiedWallpaperNotice = '';
+    /** 合并启动预热和 Webview 首次打开时对同一份播放列表的并发读取。 */
+    private wallpaperSyncPromise?: Promise<void>;
+    /** 图库页按需加载；首页首屏不发送大量列表数据。 */
+    private galleryRequested = false;
+    /** 播放列表预热完成后可直接推送，不必等用户先打开图库页。 */
+    private wallpaperPlaylistReady = false;
     /** 上次推送给面板的背景路径，用来判断"是否换壁纸了"，从而跳过防抖立刻推送。 */
     private lastPushedImagePath = '';
     /** 缩略图持久化（跨 VS Code 重启复用，避免重新渲染首帧）。 */
@@ -196,7 +207,7 @@ export class StudioViewProvider implements WebviewViewProvider {
         void this.pushThumbnails();
         void this.syncWallpaperPlaylist().then(() => this.pushState());
 
-        view.webview.onDidReceiveMessage((msg: any) => this.handleMessage(msg), undefined, this.disposables);
+        view.webview.onDidReceiveMessage((msg: unknown) => this.handleMessage(msg), undefined, this.disposables);
 
 
         // Push state on config / globalState changes
@@ -269,15 +280,15 @@ export class StudioViewProvider implements WebviewViewProvider {
             imagePath
         );
         const imageProject = getWallpaperProjectDeclaration(imagePath);
-        const wallpaperPaths = new Set(this.wallpaperEntries.map(entry => this.normalizePath(entry.path)));
+        const wallpaperPaths = new Set(this.wallpaperEntries.map(entry => normalizeComparablePath(entry.path)));
         const recentStored = gs.get<string[]>('wallpaperStudioRecentImages', []) || [];
         const currentFolder = expandPathVariables(cfg.get<string>('randomImageFolder') || '');
         const recentRaw = this.sourceMode === 'wallpaper'
-            ? recentStored.filter(item => wallpaperPaths.has(this.normalizePath(item)))
+            ? recentStored.filter(item => wallpaperPaths.has(normalizeComparablePath(item)))
             : this.sourceMode === 'folder'
                 ? recentStored.filter(item => currentFolder && this.isPathInFolder(item, currentFolder))
-                : recentStored.filter(item => !wallpaperPaths.has(this.normalizePath(item)));
-        const recentImages = recentRaw.map(p => ({
+                : recentStored.filter(item => !wallpaperPaths.has(normalizeComparablePath(item)));
+        const recentImages = this.galleryRequested ? recentRaw.map(p => ({
             path: p,
             display: this.toWebviewUri(p),
             name: this.basename(p),
@@ -285,14 +296,14 @@ export class StudioViewProvider implements WebviewViewProvider {
                 ...property,
                 value: getWallpaperPropertyOverrides(gs, p)[property.key] ?? property.value
             }))
-        }));
+        })) : [];
 
         const folder = expandPathVariables(cfg.get<string>('randomImageFolder') || '');
         const removedFolderImages = new Set(gs.get<string[]>('wallpaperStudioFolderRemoved', []) || []);
         let folderImages: { path: string; display: string; name: string }[] = [];
         let folderImagesTotal = 0;
         try {
-            if (!wallpaperMode && folder && fs.existsSync(folder) && fs.statSync(folder).isDirectory()) {
+            if (this.galleryRequested && !wallpaperMode && folder && fs.existsSync(folder) && fs.statSync(folder).isDirectory()) {
                 const names = this.listFolder(folder);
                 folderImagesTotal = names.length;
                 folderImages = names.slice(0, 2000).map(name => {
@@ -338,6 +349,17 @@ export class StudioViewProvider implements WebviewViewProvider {
                     imagePathLabel,
                     imageProperties,
                     imageProject,
+                    sceneRender: imagePath && isWallpaperPkgPath(imagePath)
+                        ? createSceneRenderConfig({
+                            url: imagePathDisplay,
+                            title: imagePathLabel || this.basename(imagePath),
+                            project: imageProject,
+                            properties: Object.fromEntries(imageProperties.map(property => [property.key, property.value])),
+                            opacity: resolveCurrentOpacity(cfg.get('opacity') ?? 0),
+                            blur: resolveCurrentBlur(cfg.get('blur') ?? 0),
+                            blendMode: resolveBlendModeValue(cfg.get('blendModel') ?? 'auto')
+                        })
+                        : undefined,
                     autoStatus: cfg.get('autoStatus') ?? false,
                     autoInterval: cfg.get('autoInterval') ?? 10,
                     sizeModel: cfg.get('sizeModel') ?? 'cover',
@@ -355,7 +377,7 @@ export class StudioViewProvider implements WebviewViewProvider {
                     wallpaperConfigPath: this.wallpaperConfigPath,
                     // 播放列表为空的原因（只在 wallpaper 模式有意义）。
                     wallpaperNotice: wallpaperMode ? this.wallpaperNotice : '',
-                    wallpaperPlaylist: this.wallpaperEntries.map(entry => ({
+                    wallpaperPlaylist: (this.galleryRequested || this.wallpaperPlaylistReady) ? this.wallpaperEntries.map(entry => ({
                         ...entry,
                         preview: entry.preview ? this.toWebviewUri(entry.preview) : '',
                         mediaSource: this.toWebviewUri(entry.path),
@@ -364,7 +386,7 @@ export class StudioViewProvider implements WebviewViewProvider {
                             ...property,
                             value: getWallpaperPropertyOverrides(gs, entry.path)[property.key] ?? property.value
                         }))
-                    }))
+                    })) : []
                 }
             }
         });
@@ -522,14 +544,12 @@ export class StudioViewProvider implements WebviewViewProvider {
         return result;
     }
 
-    private normalizePath(value: string): string {
-        return path.normalize(value).replace(/\//g, '\\').toLowerCase();
+    private isPathInFolder(value: string, folder: string): boolean {
+        return isPathInsideFolder(value, folder);
     }
 
-    private isPathInFolder(value: string, folder: string): boolean {
-        const item = this.normalizePath(value);
-        const root = this.normalizePath(folder).replace(/[\\]+$/, '') + '\\';
-        return item.startsWith(root);
+    private normalizePath(value: string): string {
+        return normalizeComparablePath(value);
     }
 
     /** Programmatic navigation hook for `view/title` menu commands. */
@@ -552,14 +572,21 @@ export class StudioViewProvider implements WebviewViewProvider {
         return getCandidatesForMode(normalizeSourceMode(mode));
     }
 
-    private async handleMessage(msg: any): Promise<void> {
-        if (!msg || typeof msg.type !== 'string') { return; }
+    private async handleMessage(value: unknown): Promise<void> {
+        if (!isWebviewMessage(value)) { return; }
+        const msg: WebviewMessage = value;
         switch (msg.type) {
             case 'ready':
                 await this.syncWallpaperPlaylist();
                 this.pushState();
                 this.notifyWallpaperNotice();
                 void this.pushThumbnails();
+                return;
+
+            case 'loadGallery':
+                this.galleryRequested = true;
+                await this.syncWallpaperPlaylist();
+                this.pushState();
                 return;
 
             case 'setSourceMode':
@@ -577,11 +604,14 @@ export class StudioViewProvider implements WebviewViewProvider {
                     } else {
                         this.wallpaperConfigEnabled = false;
                     }
-                    // 切模式后在新模式内随机选一张（只用该模式的候选）。
+                    // 切模式后只使用新模式自己的候选；没有候选时必须清空旧模式背景，
+                    // 避免首页继续显示上一模式的路径和预览。
                     const candidates = this.getModeCandidates(mode);
                     if (candidates.length) {
                         const selected = candidates[Math.floor(Math.random() * candidates.length)];
                         await commands.executeCommand('wallpaperStudio.setConfig', 'wallpaperStudio.imagePath', selected);
+                    } else {
+                        await commands.executeCommand('wallpaperStudio.runAction', 7);
                     }
                     this.pushState();
                 }
@@ -866,6 +896,7 @@ export class StudioViewProvider implements WebviewViewProvider {
 
     /** 高级页的「清除所有缓存与配置」：把扩展侧所有状态、缓存和设置恢复默认。 */
     private async resetAllState(): Promise<void> {
+        clearRuntimeState();
         const stateKeys = [
             'wallpaperStudioRecentImages',
             'wallpaperStudioWallpaperRemoved',
@@ -914,11 +945,9 @@ export class StudioViewProvider implements WebviewViewProvider {
         this.pushState();
     }
 
-    /** 当前实际生效的来源模式（Wallpaper 配置可用时优先）。 */
+    /** 当前实际生效的来源模式；模式选择本身不应被配置文件可用性覆盖。 */
     private currentSourceMode(): 'file' | 'folder' | 'wallpaper' {
-        return this.wallpaperConfigEnabled && hasWallpaperConfig(this.wallpaperConfigPath)
-            ? 'wallpaper'
-            : this.sourceMode;
+        return normalizeSourceMode(this.sourceMode);
     }
 
     /** 某个路径属于哪种来源：壁纸播放列表 / 目录媒体 / 本地文件。 */
@@ -998,12 +1027,30 @@ export class StudioViewProvider implements WebviewViewProvider {
      * @param force 为 true 时先清空 project.json 缓存，保证读到磁盘上的最新内容
      *              （「重新读取配置」按钮用）。
      */
-    private async syncWallpaperPlaylist(force = false): Promise<void> {
+    private syncWallpaperPlaylist(force = false): Promise<void> {
+        if (force) {
+            this.wallpaperSyncPromise = undefined;
+            return this.syncWallpaperPlaylistImpl(true);
+        }
+        if (this.wallpaperSyncPromise) { return this.wallpaperSyncPromise; }
+        const sync = this.syncWallpaperPlaylistImpl(false);
+        this.wallpaperSyncPromise = sync;
+        void sync.then(() => undefined, () => undefined).finally(() => {
+            if (this.wallpaperSyncPromise === sync) {
+                this.wallpaperSyncPromise = undefined;
+            }
+        });
+        return sync;
+    }
+
+    private async syncWallpaperPlaylistImpl(force = false): Promise<void> {
         this.wallpaperNotice = '';
+        this.wallpaperPlaylistReady = false;
         try {
             if (!fs.existsSync(this.wallpaperConfigPath)) {
                 this.wallpaperEntries = [];
                 this.wallpaperUser = '';
+                this.wallpaperPlaylistReady = true;
                 return;
             }
 
@@ -1035,9 +1082,11 @@ export class StudioViewProvider implements WebviewViewProvider {
                 // 列表恢复了就允许下次空列表时重新提示。
                 this.notifiedWallpaperNotice = '';
             }
+            this.wallpaperPlaylistReady = true;
         } catch (error) {
             this.wallpaperEntries = [];
             this.wallpaperNotice = '读取 Wallpaper 播放列表失败，请检查 config.json 是否完整。';
+            this.wallpaperPlaylistReady = true;
             console.error('[WallpaperStudio] Failed to sync Wallpaper Engine playlist:', error);
         }
     }

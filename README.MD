@@ -349,7 +349,8 @@ code --install-extension ".\wallpaper-studio-1.0.0.vsix" --force
 
 | 内容 | 路径 |
 |---|---|
-| 共享设置（透明度/模糊度/自动轮播/尺寸/混合模式/当前壁纸） | `%USERPROFILE%\.wallpaper-studio\settings.json` |
+| 共享设置（透明度/模糊度/自动轮播/尺寸/混合模式等） | `%USERPROFILE%\.wallpaper-studio\settings.json` |
+| 当前背景与窗口/工作区运行状态 | `%USERPROFILE%\.wallpaper-studio\runtime.json` |
 | 缩略图缓存 / 场景预览页 | `<VS Code User>/globalStorage/Alinn.wallpaper-studio/` |
 | 移除名单 / 逐壁纸配置 / 最近使用 | VS Code `globalState` |
 | 背景样式与加载器 | `<VS Code 安装目录>/resources/app/out/vs/workbench/css-wallpaper-studio.css`、`js-wallpaper-studio.js` |

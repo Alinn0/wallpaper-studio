@@ -34,6 +34,7 @@ import {
 import { isWallpaperMpkgPath, isWallpaperPkgPath, validateWallpaperPkgFile } from './wallpaperPkg';
 import { buildWallpaperSceneHtml, copyWallpaperScenePackage, loadWallpaperSceneInputs } from './wallpaperScene';
 import { getWallpaperProjectDeclaration, getWallpaperPropertyOverrides, resolveWallpaperMediaPath } from './wallpaperEngine';
+import { createSceneRenderConfig } from './sceneRender';
 import {
     BackgroundApplyCancelledError,
     BackgroundDownloadError,
@@ -1510,7 +1511,7 @@ export class FileDom {
         let cssPath = this.escapeTemplateLiteral(rawPath);
 
         if (this.isWallpaperPkg) {
-            const config = {
+            const config = createSceneRenderConfig({
                 url: this.wallpaperSceneUrl || rawPath,
                 title: path.basename(this.wallpaperPkgSourcePath || rawPath),
                 properties: getWallpaperPropertyOverrides(getContext().globalState, this.wallpaperPkgSourcePath || rawPath),
@@ -1520,7 +1521,7 @@ export class FileDom {
                 opacity: opacity,
                 blur: this.blur,
                 blendMode: resolveBlendModeValue(this.blendModel)
-            };
+            });
             const jsonConfig = JSON.stringify(config)
                 .replace(/`/g, '\\`')
                 .replace(/\$\{/g, '\\${');

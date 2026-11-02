@@ -1,4 +1,5 @@
 import { reactive } from 'vue';
+import type { SceneRenderConfig } from '../../../src/sceneRender';
 
 
 /**
@@ -15,6 +16,7 @@ export interface StudioConfig {
     imageProperties: WallpaperProperty[];
     /** 当前背景的项目声明（交给场景渲染器，缺了它属性值绑不回画面） */
     imageProject?: unknown;
+    sceneRender?: SceneRenderConfig;
     autoStatus: boolean;
     autoInterval: number;
     sizeModel: string;

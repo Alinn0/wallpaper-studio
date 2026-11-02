@@ -21,7 +21,7 @@
             if (alive || patched) return;
             if (document.visibilityState !== 'visible') return;
             patched = true;
-            // 标记给帧率探测用：rAF 已被替换成定时器，此时测到的间隔不代表屏幕刷新率。
+            // 标记给帧率探测用：rAF 已被替换成定时器，此时不能当作屏幕刷新率。
             globalThis.__wallpaperStudioFrameClockPatched = true;
             const timers = new Map();
             let counter = 0;
@@ -53,9 +53,9 @@
     /** 场景挂载前收到的最后一次指针，挂载后补发。 */
     let lastPointer;
 
-    /** 缩略图尺寸：列表里只显示 72×40，不需要原分辨率。 */
-    var THUMB_MAX_WIDTH = 320;
-    var THUMB_MAX_HEIGHT = 180;
+    /** 缩略图尺寸：首页和列表共用，背景渲染不会走这条截图链路。 */
+    var THUMB_MAX_WIDTH = 640;
+    var THUMB_MAX_HEIGHT = 360;
 
     function fitThumbSize(width, height) {
         if (!width || !height) { return { width: THUMB_MAX_WIDTH, height: THUMB_MAX_HEIGHT }; }
@@ -154,16 +154,17 @@
     });
 
     /**
-     * 用 requestAnimationFrame 采样估算显示器刷新率，作为场景渲染的帧率上限，
-     * 让动画尽量跑满屏幕刷新率（60/120/144/165/240 Hz）。
-     * 采样不足（后台标签页、被节流的渲染环境）时退到 240，等价于跟随 rAF 逐帧渲染。
+     * 用 requestAnimationFrame 采样显示器实际刷新率，作为场景渲染的帧率上限，
+     * 让动画尽量跑满屏幕刷新率（包括 60/120/144/165/240 Hz 及更高刷新率）。
+     * 采样不足时使用 360；正常情况下采样值来自浏览器的实际屏幕同步时钟。
      */
     function detectRefreshRate() {
         if (refreshRatePromise) { return refreshRatePromise; }
         refreshRatePromise = new Promise(function(resolve) {
             // rAF 已被换成定时器（宿主不可见），采样没有意义，直接跟随 rAF 逐帧渲染。
             if (globalThis.__wallpaperStudioFrameClockPatched) {
-                resolve(240);
+                // ensureFrameClock 的定时器是 30Hz，不能伪报成更高刷新率。
+                resolve(30);
                 return;
             }
             const samples = [];
@@ -179,7 +180,7 @@
             function medianFps(deltas) {
                 const sorted = deltas.slice().sort(function(a, b) { return a - b; });
                 const median = sorted[Math.floor(sorted.length / 2)] || 16.7;
-                return Math.max(24, Math.min(240, Math.round(1000 / median)));
+                return Math.max(24, Math.min(360, Math.round(1000 / median)));
             }
             timer = window.setTimeout(function() {
                 finish(samples.length >= 3 ? medianFps(samples) : 240);
@@ -265,12 +266,12 @@
             if (currentGeneration !== generation) return;
             const canvas = host.querySelector('canvas');
             if (!canvas) throw new Error('scene canvas is unavailable');
-            // 缩略图只需要小图：直接按原始画布编码会得到几百 KB 的 JPEG，
-            // 持久缓存有容量上限，超出的条目就推不到面板，等于白渲染。
+            // 这里仅用于 Webview 首页/列表缩略图；背景不调用 captureFirstFrame，
+            // 始终使用上面的原始场景画布实时渲染。
             const size = fitThumbSize(canvas.width, canvas.height);
             let dataUrl;
             if (size.width === canvas.width && size.height === canvas.height) {
-                dataUrl = canvas.toDataURL('image/jpeg', 0.75);
+                dataUrl = canvas.toDataURL('image/jpeg', 0.85);
             } else {
                 const thumb = document.createElement('canvas');
                 thumb.width = size.width;
@@ -278,7 +279,7 @@
                 const context = thumb.getContext('2d');
                 if (!context) throw new Error('thumbnail canvas is unavailable');
                 context.drawImage(canvas, 0, 0, size.width, size.height);
-                dataUrl = thumb.toDataURL('image/jpeg', 0.75);
+                dataUrl = thumb.toDataURL('image/jpeg', 0.85);
             }
             if (currentGeneration !== generation) return;
             parent.postMessage({ type: 'scene-frame', token: currentToken, dataUrl: dataUrl }, '*');

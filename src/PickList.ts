@@ -23,29 +23,10 @@ import { hasCurrentImageRecord, resolveCurrentBlur, resolveCurrentImagePath, res
 import { getCandidatesForMode, getRandomCandidates, getSourceMode, setSourceMode } from './sourceMode';
 import { expandPathVariables, isSupportedMedia, pickRandomFromFolder } from './pathUtil';
 import { getAppConfig } from './settingsStore';
+import { ActionType } from './webviewProtocol';
 
 
-
-// Action Types Enum to replace magic numbers
-export enum ActionType {
-    SelectPictures = 1,
-    AddDirectory = 2,
-    ManualSelection = 3,
-    UpdateBackground = 4,
-    BackgroundOpacity = 5,
-    InputPath = 6,
-    CloseBackground = 7,
-    ReloadWindow = 8,
-    CloseMenu = 9,
-    MoreMenu = 12,
-    OpenExternalUrl = 13,
-    OpenFilePath = 14,
-    SizeModeMenu = 15,
-    SetSizeMode = 16,
-    BackgroundBlur = 18,
-    AutoRandomSettings = 20,
-    OpenCacheFolder = 21,
-}
+export { ActionType };
 
 // Input Types Enum
 enum InputType {
@@ -61,7 +42,6 @@ interface UpdateBackgroundOptions {
 }
 
 const AUTO_IMAGE_ATTEMPTS = 3;
-2;
 
 
 
@@ -336,7 +316,7 @@ export class PickList {
         }
     }
 
-    public async handleAction(type: ActionType, path?: string) {
+    public async handleAction(type: number, path?: string) {
         switch (type) {
             case ActionType.SelectPictures: await this.openFieldDialog(1); break;
             case ActionType.AddDirectory: await this.openFieldDialog(2); break;

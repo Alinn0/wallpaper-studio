@@ -237,12 +237,14 @@ function reloadFromDisk(): AppSettings {
     }
 }
 
-function persist(settings: AppSettings): void {
+function persist(settings: AppSettings): boolean {
     try {
         fs.mkdirSync(SETTINGS_DIR, { recursive: true });
         fs.writeFileSync(SETTINGS_FILE, JSON.stringify(settings, null, 2), 'utf8');
+        return true;
     } catch (error) {
         console.warn('[WallpaperStudio] Failed to persist settings:', error);
+        return false;
     }
 }
 
@@ -332,7 +334,9 @@ export class AppConfig {
         const settings = reloadFromDisk();
         if ((settings as any)[name] === coerced) { return; }
         (settings as any)[name] = coerced;
-        persist(settings);
+        // Do not broadcast or apply a value that was not actually persisted.
+        // Otherwise the UI and the next VS Code process would disagree.
+        if (!persist(settings)) { return; }
         changeEmitter.fire([name as string]);
     }
 }

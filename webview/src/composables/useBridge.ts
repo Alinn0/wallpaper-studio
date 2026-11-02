@@ -6,10 +6,7 @@
  * webview, so it's memoised at module scope.
  */
 
-export interface OutboundMessage {
-    type: string;
-    [k: string]: any;
-}
+export type OutboundMessage = WebviewMessage;
 
 type Listener = (data: any) => void;
 
@@ -63,3 +60,4 @@ export function useBridge() {
         }
     };
 }
+import type { WebviewMessage } from '../../../src/webviewProtocol';

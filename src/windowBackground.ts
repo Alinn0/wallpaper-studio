@@ -3,6 +3,7 @@ import * as path from 'path';
 import { ConfigurationTarget, env, workspace, WorkspaceConfiguration } from 'vscode';
 import { getContext, onDidChangeGlobalState } from './global';
 import { getAppConfig } from './settingsStore';
+import { readRuntimeState, updateRuntimeState } from './runtimeStore';
 
 const WINDOW_IMAGES_KEY = 'wallpaperStudio.windowImages';
 const WORKSPACE_IMAGES_KEY = 'wallpaperStudio.workspaceImages';
@@ -70,12 +71,14 @@ export function getWindowCssFileName(): string {
 }
 
 function readImageMap(key: string): Record<string, string> {
-    return { ...(getContext().globalState.get<Record<string, string>>(key, {}) || {}) };
+    const runtime = readRuntimeState();
+    if (key === WINDOW_IMAGES_KEY) { return { ...runtime.windowImages }; }
+    if (key === WORKSPACE_IMAGES_KEY) { return { ...runtime.workspaceImages }; }
+    return {};
 }
 
 function readGlobalImage(): string | undefined {
-    const value = getContext().globalState.get<string>(GLOBAL_IMAGE_KEY);
-    return typeof value === 'string' ? value : undefined;
+    return readRuntimeState().globalImage;
 }
 
 export function hasCurrentImageRecord(): boolean {
@@ -141,8 +144,8 @@ export interface SetImageOptions {
 }
 
 /**
- * 把某个按窗口/工作区维度存储的值写入 globalState：当前窗口(session)记录 +
- * 当前工作区记录。共用模式(perWindowBackground=false)下不写任何记录，
+ * 把某个按窗口/工作区维度存储的值写入 runtime.json：当前窗口(session)记录 +
+ * 当前工作区记录。共用模式(perWindowBackground=false)下不写窗口记录，
  * 由调用方走 settings.json 保持旧版全局共享行为。
  * @param globalKey 背景图需要额外维护一份"最后一张全局兜底"，透明度/模糊度不需要。
  */
@@ -152,25 +155,35 @@ async function persistLevelValue(
     globalKey: string | undefined,
     value: string | number
 ): Promise<void> {
-    const context = getContext();
     if (isPerWindowEnabled()) {
         const sessionHash = getSessionHash();
-        const windowMap = { ...(context.globalState.get<Record<string, string | number>>(windowKey, {}) || {}) };
-        delete windowMap[sessionHash];
-        windowMap[sessionHash] = value;
-        await context.globalState.update(windowKey, pruneRecords(windowMap, sessionHash));
-
         const workspaceHash = getWorkspaceKey();
-        if (workspaceHash) {
-            const workspaceMap = { ...(context.globalState.get<Record<string, string | number>>(workspaceKey, {}) || {}) };
-            // 先删再写，把当前工作区挪到末尾：pruneRecords 按插入顺序淘汰最久未写入的记录。
-            delete workspaceMap[workspaceHash];
-            workspaceMap[workspaceHash] = value;
-            await context.globalState.update(workspaceKey, pruneRecords(workspaceMap, workspaceHash));
-        }
-    }
-    if (globalKey !== undefined) {
-        await context.globalState.update(globalKey, value);
+        const saved = updateRuntimeState(runtime => {
+            const windowMap: Record<string, string | number> = windowKey === WINDOW_IMAGES_KEY
+                ? runtime.windowImages
+                : windowKey === WINDOW_OPACITY_KEY ? runtime.windowOpacity : runtime.windowBlur;
+            delete windowMap[sessionHash];
+            windowMap[sessionHash] = value;
+            const prunedWindowMap = pruneRecords(windowMap, sessionHash);
+            Object.keys(windowMap).forEach(key => {
+                if (!(key in prunedWindowMap)) { delete windowMap[key]; }
+            });
+            const workspaceMap: Record<string, string | number> = workspaceKey === WORKSPACE_IMAGES_KEY
+                ? runtime.workspaceImages
+                : workspaceKey === WORKSPACE_OPACITY_KEY ? runtime.workspaceOpacity : runtime.workspaceBlur;
+            if (workspaceHash) {
+                delete workspaceMap[workspaceHash];
+                workspaceMap[workspaceHash] = value;
+                const prunedWorkspaceMap = pruneRecords(workspaceMap, workspaceHash);
+                Object.keys(workspaceMap).forEach(key => {
+                    if (!(key in prunedWorkspaceMap)) { delete workspaceMap[key]; }
+                });
+            }
+            if (globalKey === GLOBAL_IMAGE_KEY) { runtime.globalImage = String(value); }
+        });
+        if (!saved) { return; }
+    } else if (globalKey === GLOBAL_IMAGE_KEY) {
+        if (!updateRuntimeState(runtime => { runtime.globalImage = String(value); })) { return; }
     }
     onDidChangeGlobalState.fire();
 }
@@ -256,7 +269,7 @@ async function purgeLegacyLevelRecords(): Promise<void> {
     }
 }
 
-function pruneRecords(map: Record<string, string | number>, keepKey: string): Record<string, string | number> {
+function pruneRecords<T extends string | number>(map: Record<string, T>, keepKey: string): Record<string, T> {
     const keys = Object.keys(map);
     if (keys.length <= MAX_WINDOW_RECORDS) {
         return map;

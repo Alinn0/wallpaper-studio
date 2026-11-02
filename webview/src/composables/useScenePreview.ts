@@ -1,6 +1,7 @@
 import { reactive } from 'vue';
 import { useBridge } from './useBridge';
 import { getThumbnail, setThumbnail } from './useThumbnailCache';
+import type { SceneRenderConfig } from '../../../src/sceneRender';
 
 /**
  * Wallpaper Engine 场景包首帧预览。
@@ -414,10 +415,11 @@ function lookup(key: string, properties?: Record<string, unknown>): { exact: str
 function requestPreview(
     key: string,
     priority = false,
-    properties?: Record<string, unknown>,
-    project?: unknown
+    renderConfig?: Pick<SceneRenderConfig, 'properties' | 'project'>
 ): Promise<string | null> {
     if (!key) { return Promise.resolve(null); }
+    const properties = renderConfig?.properties;
+    const project = renderConfig?.project;
     const { exact, base } = lookup(key, properties);
     if (exact) { return Promise.resolve(exact); }
 

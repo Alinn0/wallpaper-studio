@@ -195,6 +195,7 @@ const visited = reactive(new Set<string>([initialTab]));
 
 watch(active, (value) => {
     visited.add(value);
+    if (value === 'local') { bridge.post({ type: 'loadGallery' }); }
 });
 
 bridge.on('state', (data: any) => {

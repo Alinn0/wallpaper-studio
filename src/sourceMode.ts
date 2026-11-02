@@ -11,6 +11,7 @@ import {
 import { getContext } from './global';
 import { getAppConfig } from './settingsStore';
 import { expandPathVariables } from './pathUtil';
+import { isPathInsideFolder, samePath } from './pathComparison';
 
 /**
  * 来源模式：三种模式互斥。
@@ -66,24 +67,12 @@ export function isWallpaperModeActive(): boolean {
     }
 }
 
-function samePath(a: string, b: string): boolean {
-    return path.normalize(a).replace(/\//g, '\\').toLowerCase()
-        === path.normalize(b).replace(/\//g, '\\').toLowerCase();
-}
-
 function currentFolder(): string {
     try {
         return expandPathVariables(getAppConfig().get<string>('randomImageFolder') || '');
     } catch {
         return '';
     }
-}
-
-function isInsideFolder(value: string, folder: string): boolean {
-    if (!folder) { return false; }
-    const item = path.normalize(value).replace(/\//g, '\\').toLowerCase();
-    const root = path.normalize(folder).replace(/\//g, '\\').toLowerCase().replace(/[\\]+$/, '') + '\\';
-    return item.startsWith(root);
 }
 
 /** Wallpaper 播放列表里可用的项目（只取当前用户 + 过滤已移除的）。 */
@@ -150,7 +139,7 @@ export function getFileCandidates(): string[] {
     );
     const folder = currentFolder();
     if (!folder) { return withoutPlaylist; }
-    return withoutPlaylist.filter(item => !isInsideFolder(item, folder));
+    return withoutPlaylist.filter(item => !isPathInsideFolder(item, folder));
 }
 
 /** 指定模式下的可随机候选。 */

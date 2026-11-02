@@ -1,3 +1,5 @@
+import { ref } from 'vue';
+
 /**
  * 缩略图持久缓存（场景包首帧 / 视频首帧）。
  *
@@ -23,6 +25,8 @@ let memory: Record<string, ThumbnailRecord> | null = null;
 let saveTimer: ReturnType<typeof setTimeout> | undefined;
 /** 写回扩展侧的通道（由 App.vue 注入），用于跨 VS Code 重启保留缩略图。 */
 let reporter: ((key: string, value: string) => void) | undefined;
+/** Reactive signal for views that display a cached thumbnail. */
+export const thumbnailRevision = ref(0);
 
 export function setThumbnailReporter(fn: ((key: string, value: string) => void) | undefined): void {
     reporter = fn;
@@ -47,6 +51,7 @@ export function hydrateThumbnails(data: Record<string, string> | undefined): voi
         if (cache[key]?.value) { continue; }
         cache[key] = { value, usedAt: base + (index += 1) };
     }
+    thumbnailRevision.value++;
 }
 
 function load(): Record<string, ThumbnailRecord> {
@@ -55,7 +60,14 @@ function load(): Record<string, ThumbnailRecord> {
     try {
         const raw = localStorage.getItem(CACHE_KEY);
         const parsed = raw ? JSON.parse(raw) : {};
-        if (parsed && typeof parsed === 'object') { next = parsed; }
+        if (parsed && typeof parsed === 'object') {
+            next = Object.fromEntries(Object.entries(parsed).filter(([, record]) => {
+                return !!record
+                    && typeof record === 'object'
+                    && typeof (record as ThumbnailRecord).value === 'string'
+                    && typeof (record as ThumbnailRecord).usedAt === 'number';
+            })) as Record<string, ThumbnailRecord>;
+        }
     } catch {
         next = {};
     }
@@ -88,15 +100,16 @@ export function getThumbnail(key: string): string {
     if (!key) { return ''; }
     const record = load()[key];
     if (!record?.value) { return ''; }
-    // 只是命中一次缓存，不必为它序列化整个缓存；LRU 时间戳在内存里推进就够，
-    // 真正落盘由 setThumbnail 触发。
+    // 命中时只更新内存中的时间戳；延迟落盘避免连续读取时反复序列化整个缓存。
     record.usedAt = Date.now();
+    scheduleSave();
     return record.value;
 }
 
 export function setThumbnail(key: string, value: string): void {
     if (!key || !value) { return; }
     load()[key] = { value, usedAt: Date.now() };
+    thumbnailRevision.value++;
     scheduleSave();
     try { reporter?.(key, value); } catch { /* 通道未就绪时忽略 */ }
 }
@@ -107,6 +120,7 @@ export function clearThumbnailCache(): void {
         saveTimer = undefined;
     }
     memory = {};
+    thumbnailRevision.value++;
     try {
         localStorage.removeItem(CACHE_KEY);
     } catch {

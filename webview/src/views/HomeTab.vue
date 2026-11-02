@@ -3,28 +3,31 @@
         <!-- Preview card -->
         <el-card class="preview-card" shadow="never">
             <div class="preview-frame" :class="{ 'is-empty': !displayUrl }">
+                <img
+                    v-if="previewThumbnail"
+                    :src="previewThumbnail"
+                    :alt="t('previewAlt')"
+                />
                 <video
-                    v-if="displayUrl && isVideo"
+                    v-else-if="displayUrl && isVideo && !isThumbnailGenerating"
+                    class="thumbnail-source"
                     :src="displayUrl"
-                    autoplay
                     muted
-                    loop
                     playsinline
+                    preload="auto"
+                    @loadeddata="captureVideoThumb"
+                    @canplay="captureVideoThumb"
                 />
                 <img
                     v-else-if="displayUrl && !isWallpaperPkg"
+                    class="thumbnail-source"
                     :src="displayUrl"
-                    :alt="t('previewAlt')"
-                />
-                <img
-                    v-else-if="isWallpaperPkg && sceneFrame"
-                    :src="sceneFrame"
-                    :alt="t('scenePreviewAlt')"
+                    alt=""
+                    @load="captureImageThumb"
                 />
                 <div v-else class="preview-empty">
-                    <el-icon :size="32" :class="{ 'is-loading': isSceneRendering }"><Picture /></el-icon>
+                    <el-icon :size="32"><Picture /></el-icon>
                     <span>{{ emptyText }}</span>
-                    <span v-if="sceneError" class="preview-error-detail" :title="sceneError">{{ sceneError }}</span>
                 </div>
             </div>
             <div class="preview-meta">
@@ -126,6 +129,7 @@ import { Picture, ArrowLeft, RefreshRight, Setting } from '@element-plus/icons-v
 import { useI18n } from '../composables/useI18n';
 import { useBridge } from '../composables/useBridge';
 import { useScenePreview } from '../composables/useScenePreview';
+import { getThumbnail, setThumbnail, thumbnailRevision } from '../composables/useThumbnailCache';
 import { config, state, type WallpaperProperty } from '../composables/useStore';
 import { isVideoPath, isWallpaperPkgPath } from '../utils/media';
 
@@ -159,8 +163,8 @@ const selectedMode = computed({
 // 只用扩展侧给出的本地路径。在线地址一律不直连，避免每次刷新都回源云存储。
 const displayUrl = computed(() => config.imagePathDisplay || '');
 
-const isVideo = computed(() => isVideoPath(config.imagePath));
 const isWallpaperPkg = computed(() => isWallpaperPkgPath(config.imagePath));
+const isVideo = computed(() => isVideoPath(config.imagePath));
 const samePath = (a: string, b: string) =>
     !!a && !!b && a.replace(/\\/g, '/').toLowerCase() === b.replace(/\\/g, '/').toLowerCase();
 
@@ -220,72 +224,84 @@ watch(currentKey, () => {
 watch(properties, syncViewOffsets);
 syncViewOffsets();
 
-// 场景包没法直接用 <img> 预览，先让离屏渲染器出首帧（见 useScenePreview）。
-const sceneFrame = ref('');
-const sceneFailed = ref(false);
-/** 渲染失败时渲染器/宿主给出的具体原因，直接显示出来便于定位。 */
-const sceneError = ref('');
-// 首帧渲染期间 display 可能还是上一次的图，所以空态文案跟着 imagePath 走。
-const isSceneRendering = computed(() => isWallpaperPkg.value && !sceneFrame.value && !sceneFailed.value);
 const emptyText = computed(() => {
-    if (!isWallpaperPkg.value) { return t('none'); }
-    return sceneFailed.value ? t('scenePreviewFailed') : t('scenePreviewRendering');
+    if (!config.imagePath) { return t('none'); }
+    return t('scenePreviewRendering');
 });
 
-/** 场景包首帧要用的属性表：项目配置 + 当前 XY 视角。 */
-const sceneProperties = computed<Record<string, unknown>>(() => {
-    const record: Record<string, unknown> = {};
-    for (const property of properties.value) {
-        if (property.type === 'group' || property.type === 'header' || property.type === 'label') { continue; }
-        record[property.key] = property.value;
-    }
-    if (config.imagePath) {
-        record.wallpaperstudio_pan_x = cameraPanX.value;
-        record.wallpaperstudio_pan_y = cameraPanY.value;
-    }
-    return record;
-});
+const isThumbnailGenerating = ref(false);
 
-function requestSceneFrame(priority: boolean) {
-    const key = displayUrl.value;
-    if (!key || !isWallpaperPkg.value) { return; }
-    const props = Object.keys(sceneProperties.value).length ? sceneProperties.value : undefined;
-    const cached = scenePreview.previewOf(key, props);
-    if (cached) {
-        sceneFrame.value = cached;
-        sceneFailed.value = false;
-        return;
-    }
-    void scenePreview.requestPreview(key, priority, props, config.imageProject).then(url => {
-        if (displayUrl.value !== key) { return; }
-        if (url) {
-            sceneFrame.value = url;
-            sceneFailed.value = false;
-            sceneError.value = '';
-        } else {
-            sceneFailed.value = true;
-            sceneError.value = scenePreview.lastError(key, props);
-        }
-    });
+/** 首页和列表共用同一组缓存键与缩略图尺寸。 */
+const THUMB_WIDTH = 640;
+const THUMB_HEIGHT = 360;
+function fitThumbSize(width: number, height: number): { width: number; height: number } {
+    if (!width || !height) { return { width: THUMB_WIDTH, height: THUMB_HEIGHT }; }
+    const scale = Math.min(THUMB_WIDTH / width, THUMB_HEIGHT / height, 1);
+    return { width: Math.max(1, Math.round(width * scale)), height: Math.max(1, Math.round(height * scale)) };
 }
 
-watch([displayUrl, currentKey], () => {
-    sceneFrame.value = '';
-    sceneFailed.value = false;
-    sceneError.value = '';
-    requestSceneFrame(true);
-}, { immediate: true });
+function captureImageThumb(event: Event) {
+    const img = event.currentTarget as HTMLImageElement | null;
+    const key = config.imagePath;
+    if (!img || !key || !img.naturalWidth || !img.naturalHeight || getThumbnail(`image:${key}`)) { return; }
+    const size = fitThumbSize(img.naturalWidth, img.naturalHeight);
+    const canvas = document.createElement('canvas');
+    canvas.width = size.width;
+    canvas.height = size.height;
+    const context = canvas.getContext('2d');
+    if (!context) { return; }
+    try {
+        setThumbnail(`image:${key}`, canvasToThumbnail(context, img, canvas));
+    } catch (error) {
+        console.warn('[WallpaperStudio] Failed to capture home image thumbnail:', key, error);
+    }
+}
 
-// 改配置 / 拖 XY 之后重渲染首帧，让面板预览和实际背景保持一致（节流，避免拖动时排队）。
-let previewTimer: ReturnType<typeof setTimeout> | undefined;
-watch(sceneProperties, () => {
-    if (!isWallpaperPkg.value || !displayUrl.value) { return; }
-    if (previewTimer) { clearTimeout(previewTimer); }
-    previewTimer = setTimeout(() => {
-        previewTimer = undefined;
-        requestSceneFrame(true);
-    }, 700);
-}, { deep: true });
+function captureVideoThumb(event: Event) {
+    const video = event.currentTarget as HTMLVideoElement | null;
+    const key = config.imagePath;
+    if (!video || !key || !video.videoWidth || !video.videoHeight || getThumbnail(`video:${key}`)) { return; }
+    const size = fitThumbSize(video.videoWidth, video.videoHeight);
+    const canvas = document.createElement('canvas');
+    canvas.width = size.width;
+    canvas.height = size.height;
+    const context = canvas.getContext('2d');
+    if (!context) { return; }
+    try {
+        setThumbnail(`video:${key}`, canvasToThumbnail(context, video, canvas));
+        video.pause();
+    } catch (error) {
+        console.warn('[WallpaperStudio] Failed to capture home video thumbnail:', key, error);
+    }
+}
+
+function canvasToThumbnail(context: CanvasRenderingContext2D, source: CanvasImageSource, canvas: HTMLCanvasElement): string {
+    context.drawImage(source, 0, 0, canvas.width, canvas.height);
+    return canvas.toDataURL('image/jpeg', 0.8);
+}
+
+/** 首页优先显示缓存；缓存未命中时只生成一次缩略图，不显示实时媒体。 */
+const previewThumbnail = computed(() => {
+    void thumbnailRevision.value;
+    const path = config.imagePath;
+    if (!path) { return ''; }
+    if (isWallpaperPkg.value) {
+        // The list stores scene frames by sceneSource (normally the package URI).
+        // Keep the raw path fallback for caches created before URI normalization.
+        return getThumbnail(`scene:${config.imagePathDisplay}`)
+            || getThumbnail(`scene:${path}`)
+            || '';
+    }
+    return getThumbnail(`${isVideoPath(path) ? 'video' : 'image'}:${path}`) || '';
+});
+
+watch([currentKey, previewThumbnail], () => {
+    if (!isWallpaperPkg.value || !displayUrl.value || previewThumbnail.value) { return; }
+    isThumbnailGenerating.value = true;
+    void scenePreview.requestPreview(displayUrl.value, true, config.sceneRender).finally(() => {
+        isThumbnailGenerating.value = false;
+    });
+}, { immediate: true });
 
 const shortPath = computed(() => {
     const p = config.imagePath || '';
@@ -420,7 +436,15 @@ function onViewOffsetInput() {
         0 0 0 1px rgba(56, 189, 248, 0.06) inset,
         0 10px 30px rgba(0, 0, 0, 0.35);
     transition: transform 0.18s ease, box-shadow 0.18s ease;
-    img, video { width: 100%; height: 100%; object-fit: cover; display: block; }
+    img, video { width: 100%; height: 100%; object-fit: cover; display: block;     }
+
+    .thumbnail-source {
+        position: absolute;
+        width: 1px;
+        height: 1px;
+        opacity: 0;
+        pointer-events: none;
+    }
     &.is-empty {
         display: flex;
         align-items: center;

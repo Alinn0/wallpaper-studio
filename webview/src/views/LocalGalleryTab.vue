@@ -180,8 +180,8 @@ const mediaFrames = reactive<Record<string, string>>({});
  * 是 3840×2160 —— 一张 JPEG 能到 1 MB，几十张就把缓存和传输通道全堵死
  * （持久缓存有容量上限，超出的条目根本推不到面板，表现就是"有缓存还是要重新加载"）。
  */
-const THUMB_WIDTH = 320;
-const THUMB_HEIGHT = 180;
+const THUMB_WIDTH = 640;
+const THUMB_HEIGHT = 360;
 
 function fitThumbSize(width: number, height: number): { width: number; height: number } {
     if (!width || !height) { return { width: THUMB_WIDTH, height: THUMB_HEIGHT }; }
