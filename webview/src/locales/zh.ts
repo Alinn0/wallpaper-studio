@@ -23,6 +23,7 @@ export default {
     searchWallpapers: '搜索壁纸',
     randomWallpaper: '随机壁纸',
     wallpaperPlaylistEmpty: '所选播放列表中没有可用壁纸。',
+    wallpaperPlaylistLoading: '正在加载壁纸：{loaded}/{total}',
     useWallpaper: '使用',
     removeFromPlaylist: '移除',
     wallpaperSettings: '设置',

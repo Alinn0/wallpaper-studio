@@ -23,6 +23,7 @@ export default {
     searchWallpapers: 'Search wallpapers',
     randomWallpaper: 'Random wallpaper',
     wallpaperPlaylistEmpty: 'No wallpapers found in the selected playlist.',
+    wallpaperPlaylistLoading: 'Loading wallpapers: {loaded}/{total}',
     useWallpaper: 'Use',
     removeFromPlaylist: 'Remove',
     wallpaperSettings: 'Settings',

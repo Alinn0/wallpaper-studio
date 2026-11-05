@@ -5,7 +5,7 @@ const path = require('path');
 const { isWallpaperMpkgPath, isWallpaperPkgPath, parseWallpaperPkgHeader, validateWallpaperPkgFile } = require('../out/wallpaperPkg');
 const { patchMediaCsp, restoreMediaCsp } = require('../out/patchCleanup');
 const { cleanAppOut } = require('../out/uninstall');
-const { buildWallpaperSceneHtml, buildWallpaperScenePage, copyWallpaperScenePackage, loadWallpaperSceneInputs } = require('../out/wallpaperScene');
+const { buildWallpaperSceneHtml, buildWallpaperScenePage, copyWallpaperScenePackage, loadWallpaperSceneInputs, patchWallpaperSceneRuntime } = require('../out/wallpaperScene');
 
 function makeHeader(magic) {
     const magicLength = Buffer.byteLength(magic, 'ascii');
@@ -66,11 +66,41 @@ assert(/window\.requestAnimationFrame = function/.test(sceneScriptSource), 'scen
 // 就绪通知是一次性消息，容易在宿主挂监听前丢失；面板必须能靠 ping 重新确认渲染器已就绪。
 assert(sceneScriptSource.includes('renderer-ready'), 'scene script must announce renderer readiness');
 assert(/type === 'ping'/.test(sceneScriptSource), 'scene script must answer readiness pings');
+// XY 视角必须走投影窗口对齐：不能再靠扩大宿主 / CSS 缩放模拟移动。
+assert(sceneScriptSource.includes('setCoverAlign('), 'scene script must apply XY through cover alignment');
+assert(sceneScriptSource.includes('installFitGuard'), 'scene script must reapply XY after the renderer resets cover alignment');
+assert(!/scale\(\s*0?\.5\s*\)/.test(sceneScriptSource), 'scene script must not fake pan with CSS scale');
+assert(!sceneScriptSource.includes("'200%'"), 'scene script must not enlarge the host to pan');
 
 const scenePreviewSource = fs.readFileSync(path.join(__dirname, '..', 'webview', 'src', 'composables', 'useScenePreview.ts'), 'utf8');
 assert(scenePreviewSource.includes('waitForRenderer'), 'panel preview must handshake instead of trusting a one-shot ready message');
 assert(scenePreviewSource.includes("type: 'ping'"), 'panel preview handshake must ping the scene page');
 assert(scenePreviewSource.includes('lastError'), 'panel preview must expose the failure reason to the UI');
+
+// 列表加载进度必须显示在空态位置，并且加载期间不再显示旧列表。
+const gallerySource = fs.readFileSync(path.join(__dirname, '..', 'webview', 'src', 'views', 'LocalGalleryTab.vue'), 'utf8');
+assert(gallerySource.includes('isLoadingPlaylist'), 'gallery must derive a loading flag for the playlist');
+assert(
+    /if \(isLoadingPlaylist\.value\) \{ return \[\]; \}/.test(gallerySource),
+    'gallery must hide the stale playlist while loading so the progress text is what users see'
+);
+assert(
+    gallerySource.includes('!state.wallpaperLoadedOnce'),
+    'gallery must treat "never loaded yet" as loading instead of showing the empty state'
+);
+assert(
+    gallerySource.includes('const total = state.wallpaperTotal > 0 ? String(state.wallpaperTotal) : \'?\''),
+    'gallery must show 0/? until the total is known'
+);
+assert(
+    /:description="displayLoadingDescription \|\| emptyDescription"/.test(gallerySource) ||
+    (gallerySource.includes('playlist-loading') && gallerySource.includes('{{ displayLoadingDescription }}')),
+    'gallery loading text must replace the empty-playlist description in place'
+);
+assert(
+    gallerySource.includes('playlist-loading-icon'),
+    'gallery must render a spinner in the empty state while loading'
+);
 
 const uninstallOut = fs.mkdtempSync(path.join(os.tmpdir(), 'wallpaper-studio-uninstall-test-'));
 const workbenchDir = path.join(uninstallOut, 'vs', 'workbench');
@@ -120,6 +150,56 @@ fs.writeFileSync(validPkgPath, makeHeader('PKGV0012'));
     const inputs = await loadWallpaperSceneInputs(repoRoot);
     assert(inputs.runtime.length > 1000, 'WebWallGL global bundle must be readable from node_modules');
     assert(inputs.sceneScript.includes('scene-frame'));
+
+    // 运行时补丁：setCoverAlign 只能注入一次，且要同步 DOM object-position。
+    assert(inputs.runtime.includes('setCoverAlign(x, y)'), 'WebWallGL runtime must expose setCoverAlign');
+    assert(inputs.runtime.includes('objectPosition'), 'setCoverAlign must sync DOM object-position');
+    assert.strictEqual(
+        inputs.runtime.split('/* wallpaper-studio-cover-align */').length - 1,
+        1,
+        'cover alignment patch must be injected exactly once'
+    );
+    assert.strictEqual(
+        patchWallpaperSceneRuntime(inputs.runtime),
+        inputs.runtime,
+        'cover alignment patch must be idempotent'
+    );
+    assert.throws(
+        () => patchWallpaperSceneRuntime('var nothingPatchable = true;'),
+        /patchable scene instance API/,
+        'missing runtime API must fail loudly instead of silently degrading'
+    );
+
+    // 插入点必须落在真正的实例方法上：不能把 setProperties 的形参当成运行时对象。
+    const alignMarker = '/* wallpaper-studio-cover-align */';
+    const alignStart = inputs.runtime.indexOf(alignMarker);
+    const setPropertiesAt = inputs.runtime.indexOf('setProperties(', alignStart);
+    const snippet = inputs.runtime.slice(alignStart, setPropertiesAt);
+    const setPropertiesParam = /setProperties\(([A-Za-z_$][\w$]*)\)/.exec(
+        inputs.runtime.slice(setPropertiesAt, setPropertiesAt + 60)
+    )[1];
+    const receiver = /([A-Za-z_$][\w$]*)\.coverAlign\.x = ax/.exec(snippet)[1];
+    assert.notStrictEqual(
+        receiver,
+        setPropertiesParam,
+        'cover alignment patch must target the runtime object, not the setProperties parameter'
+    );
+    const alignRuntime = {
+        coverAlign: { x: 0.5, y: 0.5, tx: 0.5, ty: 0.5 },
+        video: { style: {} },
+        img: null
+    };
+    const applied = new Function(
+        '__runtime',
+        `const ${receiver} = __runtime; return {${snippet}};`
+    )(alignRuntime);
+    applied.setCoverAlign(0, 1);
+    assert.deepStrictEqual(alignRuntime.coverAlign, { x: 0, y: 1, tx: 0, ty: 1 });
+    assert.strictEqual(alignRuntime.video.style.objectPosition, '0.00% 100.00%', 'setCoverAlign must sync DOM object-position');
+    applied.setCoverAlign(1.7, -0.3);
+    assert.deepStrictEqual(alignRuntime.coverAlign, { x: 1, y: 0, tx: 1, ty: 0 }, 'setCoverAlign must clamp to 0…1');
+    applied.setCoverAlign('abc', undefined);
+    assert.deepStrictEqual(alignRuntime.coverAlign, { x: 0, y: 0, tx: 0, ty: 0 }, 'setCoverAlign must not propagate NaN');
     console.log('Wallpaper Engine .pkg validation tests passed.');
 })().catch((error) => {
     console.error(error);

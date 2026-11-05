@@ -4,6 +4,49 @@ import * as path from 'path';
 
 const WEBWALLGL_PLACEHOLDER = '__WALLPAPER_STUDIO_WEBWALLGL_BASE64__';
 const SCENE_PLACEHOLDER = '__WALLPAPER_STUDIO_SCENE_BASE64__';
+const COVER_ALIGN_PATCH_MARKER = '/* wallpaper-studio-cover-align */';
+
+/**
+ * WebWallGL 已经在场景渲染器内部使用 coverAlign 计算投影窗口，但 3.0.0
+ * 没有把它暴露给宿主。只给内联运行时补一个极小的实例方法，避免通过
+ * DOM 尺寸/缩放模拟视角移动。
+ */
+export function patchWallpaperSceneRuntime(runtime: string): string {
+    if (runtime.indexOf(COVER_ALIGN_PATCH_MARKER) !== -1) { return runtime; }
+    // 运行时里可能有多个 setProperties；只认把属性转发给 sceneCtl / liveUserProps 的
+    // 实例方法，否则会把「另一个方法的形参」误当成运行时对象。
+    const methodRegex = /setProperties\(([A-Za-z_$][\w$]*)\)\s*\{/g;
+    let match: RegExpExecArray | null;
+    let index = -1;
+    let receiver = '';
+    while ((match = methodRegex.exec(runtime))) {
+        const body = runtime.slice(match.index, match.index + 600);
+        const owner = /([A-Za-z_$][\w$]*)\.(?:sceneCtl\??\.applyUserProperties|liveUserProps)/.exec(body);
+        if (!owner) { continue; }
+        index = match.index;
+        receiver = owner[1];
+        break;
+    }
+    if (index === -1 || !receiver) {
+        throw new Error('WebWallGL runtime does not expose a patchable scene instance API.');
+    }
+    const method = `${COVER_ALIGN_PATCH_MARKER}
+    setCoverAlign(x, y) {
+      const ax = Math.max(0, Math.min(1, Number(x) || 0));
+      const ay = Math.max(0, Math.min(1, Number(y) || 0));
+      ${receiver}.coverAlign.x = ax;
+      ${receiver}.coverAlign.y = ay;
+      ${receiver}.coverAlign.tx = ax;
+      ${receiver}.coverAlign.ty = ay;
+      // 视频/图片类型的 DOM 渲染路径靠 object-position 生效，只改数值不会重排。
+      const dom = ${receiver}.video || ${receiver}.img;
+      if (dom && dom.style) {
+        dom.style.objectPosition = (ax * 100).toFixed(2) + '% ' + (ay * 100).toFixed(2) + '%';
+      }
+    },
+    `;
+    return runtime.slice(0, index) + method + runtime.slice(index);
+}
 
 function hashFile(filePath: string): Promise<string> {
     return new Promise((resolve, reject) => {
@@ -63,7 +106,7 @@ export async function loadWallpaperSceneInputs(extensionPath: string): Promise<W
         fs.promises.readFile(path.join(resourcesPath, 'wallpaper-scene.html'), 'utf8'),
         fs.promises.readFile(path.join(resourcesPath, 'wallpaper-scene.js'), 'utf8')
     ]);
-    return { template, runtime, sceneScript };
+    return { template, runtime: patchWallpaperSceneRuntime(runtime), sceneScript };
 }
 
 /**

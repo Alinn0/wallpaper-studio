@@ -4,6 +4,7 @@ import {
     DEFAULT_WALLPAPER_CONFIG,
     WALLPAPER_USER_KEY,
     hasWallpaperConfig,
+    readCachedWallpaperPlaylist,
     readRemovedWallpapers,
     readWallpaperPlaylist,
     resolveActiveWallpaperUser
@@ -88,11 +89,11 @@ export function getWallpaperCandidates(): string[] {
             configPath,
             context.globalState.get<string>(WALLPAPER_USER_KEY, '')
         );
-        return readWallpaperPlaylist(
-            configPath,
-            readRemovedWallpapers(context.globalState),
-            active?.user
-        )
+        const removed = readRemovedWallpapers(context.globalState);
+        // 面板加载过完整列表就直接用缓存，避免为了拿候选路径再同步解析一遍。
+        const entries = readCachedWallpaperPlaylist(configPath, removed, active?.user)
+            ?? readWallpaperPlaylist(configPath, removed, active?.user);
+        return entries
             .filter(entry => entry.active && fs.existsSync(entry.path))
             .map(entry => entry.path);
     } catch {

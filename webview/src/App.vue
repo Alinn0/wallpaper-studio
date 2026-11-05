@@ -106,7 +106,7 @@ import AdvancedTab from './views/AdvancedTab.vue';
 import { useTheme } from './composables/useTheme';
 import { useBridge } from './composables/useBridge';
 import { useI18n, setLocale, type Locale } from './composables/useI18n';
-import { applyState, brand } from './composables/useStore';
+import { applyState, brand, state } from './composables/useStore';
 import { clearThumbnailCache, hydrateThumbnails, setThumbnailReporter } from './composables/useThumbnailCache';
 import { useScenePreview } from './composables/useScenePreview';
 
@@ -183,18 +183,13 @@ const views: Record<string, any> = {
     advanced: AdvancedTab
 };
 
-/**
- * 面板固定从「首页」打开。
- *
- * 之前会恢复上次停留的页签，但用户希望每次打开都先看到首页
- * （当前壁纸、切换模式、全局设置都在那里），因此不再读取 `activeTab`。
- */
-const initialTab = 'home';
+const initialTab = prefs.activeTab && views[prefs.activeTab] ? prefs.activeTab : 'home';
 const active = ref(initialTab);
 const visited = reactive(new Set<string>([initialTab]));
 
 watch(active, (value) => {
     visited.add(value);
+    bridge.patchState({ activeTab: value });
     if (value === 'local') { bridge.post({ type: 'loadGallery' }); }
 });
 
@@ -202,6 +197,12 @@ bridge.on('state', (data: any) => {
     const payload = data?.data ?? {};
     if (payload.locale && !userLocaleOverride.value) { setLocale(payload.locale); }
     applyState(payload);
+});
+
+bridge.on('wallpaper-loading', (data: any) => {
+    state.wallpaperLoading = data?.loading === true;
+    state.wallpaperLoaded = Number(data?.loaded) || 0;
+    state.wallpaperTotal = Number(data?.total) || 0;
 });
 
 bridge.on('navigate', (data: any) => {
@@ -220,10 +221,9 @@ bridge.on('purgeLocalCache', () => {
     scenePreview.releaseFrame();
     userLocaleOverride.value = null;
     uiTheme.value = 'default';
-    active.value = 'home';
     try {
         localStorage.clear();
-        bridge.patchState({ uiTheme: 'default', locale: undefined, activeTab: 'home' });
+        bridge.patchState({ uiTheme: 'default', locale: undefined });
     } catch { /* localStorage 不可用时忽略 */ }
 });
 
@@ -263,6 +263,9 @@ bridge.on('thumbnails', (data: any) => {
 
 onMounted(() => {
     bridge.post({ type: 'ready' });
+    // 面板恢复到最后停留在「壁纸列表」页时，watch 不会触发（初始值不算变更），
+    // 必须在这里补一次请求，否则列表会一直停在空态。
+    if (active.value === 'local') { bridge.post({ type: 'loadGallery' }); }
 });
 </script>
 

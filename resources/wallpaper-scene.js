@@ -52,6 +52,8 @@
     let refreshRatePromise;
     /** 场景挂载前收到的最后一次指针，挂载后补发。 */
     let lastPointer;
+    /** 最近一次生效的属性：setFit 会把 coverAlign 重置成居中，需要重新补上视角。 */
+    let currentProperties = {};
 
     /** 缩略图尺寸：首页和列表共用，背景渲染不会走这条截图链路。 */
     var THUMB_MAX_WIDTH = 640;
@@ -70,41 +72,49 @@
         parent.postMessage({ type: 'renderer-ready' }, '*');
     }
 
-    /**
-     * 相机视角平移 —— **纯平移，不缩放**。
-     *
-     * 两个滑块都是百分比语义、默认 100：
-     *   panX / panY：0…200，100 居中，0 贴左/上，200 贴右/下
-     *
-     * 画面始终保持 100% 大小，只做位置偏移（最多半个视口），
-     * 所以推到两端时会露出空白 —— 这是刻意接受的：平移和缩放彻底解耦，
-     * 滑块动多少，画面就移多少，不会因为自动放大而产生"跳变"的错觉。
-     *
-     * 定位用 left/top（相对视口）而不是百分比 transform（相对元素自身尺寸），
-     * 尺寸不变时两者等价，但 left/top 的换算更直观。
-     */
-    var PAN_RANGE = 50; // 端点位移：视口宽/高的 50%
-
     function readSlider(raw, fallback) {
         var n = Number(raw);
         return isFinite(n) ? n : fallback;
     }
 
     function applyViewOffset(properties) {
-        var xRaw = readSlider(properties.wallpaperstudio_pan_x, 100);
-        var yRaw = readSlider(properties.wallpaperstudio_pan_y, 100);
+        if (properties) { currentProperties = properties; }
+        var xRaw = readSlider(currentProperties.wallpaperstudio_pan_x, 100);
+        var yRaw = readSlider(currentProperties.wallpaperstudio_pan_y, 100);
 
-        // 0…200 → -1…1；100 为居中
-        var px = Math.max(-1, Math.min(1, (xRaw - 100) / 100));
-        var py = Math.max(-1, Math.min(1, (yRaw - 100) / 100));
+        // 0…200 → 0…1；100 为居中。对齐只改变 cover 的投影窗口，
+        // 不改变宿主、canvas 或视觉缩放比例。
+        var alignX = Math.max(0, Math.min(1, xRaw / 200));
+        var alignY = Math.max(0, Math.min(1, yRaw / 200));
 
         host.style.position = 'relative';
         host.style.width = '100%';
         host.style.height = '100%';
-        host.style.left = (px * PAN_RANGE) + '%';
-        host.style.top = (py * PAN_RANGE) + '%';
-        // 旧版本用 transform 平移，这里显式清掉，避免两者叠加。
+        host.style.left = '0';
+        host.style.top = '0';
+        host.style.transformOrigin = '';
         host.style.transform = 'none';
+        if (scene && typeof scene.setCoverAlign === 'function') {
+            scene.setCoverAlign(alignX, alignY);
+        }
+    }
+
+    /**
+     * setFit() 内部会调用 resetCoverAlign() 把视口对齐打回居中；
+     * 包一层在调用后重放用户视角，避免 fit 变更把 XY 结果吃掉。
+     */
+    function installFitGuard(instance) {
+        if (!instance || instance.__wallpaperStudioFitGuard) { return; }
+        if (typeof instance.setFit !== 'function') { return; }
+        var originalSetFit = instance.setFit;
+        try {
+            instance.setFit = function(fit) {
+                var result = originalSetFit.call(instance, fit);
+                applyViewOffset();
+                return result;
+            };
+            instance.__wallpaperStudioFitGuard = true;
+        } catch (e) { /* 实例只读时放弃保护，不影响渲染 */ }
     }
 
     window.addEventListener('message', function(event) {
@@ -146,6 +156,7 @@
                 scene = undefined;
             }
             token = '';
+            currentProperties = {};
             host.replaceChildren();
             return;
         }
@@ -235,13 +246,15 @@
                 properties: message.properties || {},
                 bake: false
             });
-            applyViewOffset(message.properties || {});
             if (currentGeneration !== generation || token !== message.token) {
                 instance.destroy({ releasePkgCache: true });
                 return;
             }
 
             scene = instance;
+            currentProperties = message.properties || {};
+            applyViewOffset();
+            installFitGuard(instance);
             void refreshRatePromise.then(function(fps) {
                 if (currentGeneration === generation && token === message.token && scene === instance) {
                     try { instance.setFps(fps); } catch (e) { /* renderer may be closing */ }

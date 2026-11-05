@@ -35,6 +35,11 @@ export interface StudioState {
     wallpaperConfigEnabled: boolean;
     /** 播放列表为空时的具体原因（只在 wallpaper 模式有值）。 */
     wallpaperNotice?: string;
+    wallpaperLoading: boolean;
+    wallpaperLoaded: number;
+    wallpaperTotal: number;
+    /** 扩展侧是否已经完成过一次播放列表读取；false 时面板必须显示加载态。 */
+    wallpaperLoadedOnce: boolean;
     wallpaperPlaylist: Array<{
         path: string;
         title: string;
@@ -91,6 +96,10 @@ export const state = reactive<StudioState>({
     wallpaperConfigPath: '',
     wallpaperConfigEnabled: false,
     wallpaperNotice: '',
+    wallpaperLoading: false,
+    wallpaperLoaded: 0,
+    wallpaperTotal: 0,
+    wallpaperLoadedOnce: false,
     wallpaperPlaylist: []
 });
 

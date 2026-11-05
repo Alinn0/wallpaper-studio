@@ -496,7 +496,8 @@ export function hasWallpaperConfig(configPath?: string): boolean {
 export function readWallpaperPlaylist(
     configPath: string,
     removed: string[] = [],
-    user?: string
+    user?: string,
+    onProgress?: (loaded: number, total: number) => void
 ): WallpaperEntry[] {
     const root = readJson(configPath);
     const users = listWallpaperUsers(root);
@@ -509,8 +510,10 @@ export function readWallpaperPlaylist(
     const paths = targets
         .flatMap(item => readUserPlaylist(root, item))
         .map(item => resolvePackagePath(item, configPath, root));
+    onProgress?.(0, paths.length);
     const entries: WallpaperEntry[] = [];
-    for (const wallpaperPath of paths) {
+    for (const [index, wallpaperPath] of paths.entries()) {
+        onProgress?.(index + 1, paths.length);
         const kind = classifyWallpaperPath(wallpaperPath);
         // 只保留扩展能渲染的类型：场景包与视频。
         // 网页壁纸（type=web / .html）和应用程序壁纸（type=application）一律不导入，
@@ -535,6 +538,78 @@ export function readWallpaperPlaylist(
             properties: info.properties
         });
     }
+    if (!paths.length) { onProgress?.(0, 0); }
+    const seen = new Set<string>();
+    return entries.filter(entry => {
+        const key = normalize(entry.path);
+        if (seen.has(key)) { return false; }
+        seen.add(key);
+        return true;
+    });
+}
+
+/** 让出事件循环：解析期间必须能发出进度消息、让面板重绘。 */
+function yieldToEventLoop(): Promise<void> {
+    return new Promise<void>(resolve => {
+        const immediate = (globalThis as { setImmediate?: (cb: () => void) => unknown }).setImmediate;
+        if (typeof immediate === 'function') {
+            immediate(resolve);
+        } else {
+            setTimeout(resolve, 0);
+        }
+    });
+}
+
+/**
+ * 分批读取播放列表，避免大量 project.json 同步解析长时间占用扩展宿主事件循环。
+ * 进度回调只报告当前项，不负责发送完整面板状态。
+ *
+ * 每处理一项都让出一次事件循环：只有真正回到事件循环，进度消息才会被发出去，
+ * 面板才能实时看到「正在加载壁纸：已加载/总数量」在走，而不是结束时一次性出现。
+ */
+export async function readWallpaperPlaylistAsync(
+    configPath: string,
+    removed: string[] = [],
+    user?: string,
+    onProgress?: (loaded: number, total: number) => void
+): Promise<WallpaperEntry[]> {
+    const root = readJson(configPath);
+    const users = listWallpaperUsers(root);
+    const owner = user ? users.find(item => item === user) : undefined;
+    if (user && !owner) { return []; }
+    const targets = owner ? [owner] : users;
+    const removedKeys = new Set(removed.map(normalize));
+    const paths = targets
+        .flatMap(item => readUserPlaylist(root, item))
+        .map(item => resolvePackagePath(item, configPath, root));
+    const entries: WallpaperEntry[] = [];
+    onProgress?.(0, paths.length);
+
+    for (const [index, wallpaperPath] of paths.entries()) {
+        const kind = classifyWallpaperPath(wallpaperPath);
+        if (isSupportedWallpaperKind(kind)) {
+            const info = getProjectInfo(wallpaperPath);
+            let mediaPath = wallpaperPath;
+            if (kind === 'video' && !VIDEO_EXTENSIONS.includes(path.extname(mediaPath).toLowerCase())) {
+                const candidate = info.entryFile
+                    ? path.join(path.dirname(mediaPath), info.entryFile)
+                    : '';
+                if (candidate && fs.existsSync(candidate)) { mediaPath = candidate; }
+            }
+            entries.push({
+                path: mediaPath,
+                title: info.title,
+                description: info.description,
+                preview: fs.existsSync(info.preview) ? info.preview : '',
+                sceneSource: kind === 'scene' ? mediaPath : '',
+                active: !removedKeys.has(normalize(mediaPath)),
+                properties: info.properties
+            });
+        }
+        onProgress?.(index + 1, paths.length);
+        await yieldToEventLoop();
+    }
+
     const seen = new Set<string>();
     return entries.filter(entry => {
         const key = normalize(entry.path);
@@ -546,6 +621,55 @@ export function readWallpaperPlaylist(
 
 export function readRemovedWallpapers(globalState: { get<T>(key: string, defaultValue: T): T }): string[] {
     return globalState.get<string[]>(REMOVED_KEY, []);
+}
+
+interface WallpaperPlaylistCache {
+    configPath: string;
+    user: string;
+    removedKey: string;
+    entries: WallpaperEntry[];
+}
+
+let playlistCache: WallpaperPlaylistCache | undefined;
+
+function removedKeyOf(removed: string[]): string {
+    return removed.map(normalize).sort().join('\n');
+}
+
+/**
+ * 记住最近一次完整解析的结果。
+ *
+ * 随机/上一张/自动轮播只需要候选路径，没必要为了取路径同步解析上百个
+ * project.json；条件（config 路径 / 用户 / 移除列表）一致时直接复用。
+ */
+export function rememberWallpaperPlaylist(
+    configPath: string,
+    removed: string[],
+    user: string | undefined,
+    entries: WallpaperEntry[]
+): void {
+    playlistCache = {
+        configPath: normalize(configPath),
+        user: user || '',
+        removedKey: removedKeyOf(removed),
+        entries
+    };
+}
+
+export function forgetWallpaperPlaylist(): void {
+    playlistCache = undefined;
+}
+
+export function readCachedWallpaperPlaylist(
+    configPath: string,
+    removed: string[] = [],
+    user?: string
+): WallpaperEntry[] | undefined {
+    if (!playlistCache) { return undefined; }
+    if (playlistCache.configPath !== normalize(configPath)) { return undefined; }
+    if (playlistCache.user !== (user || '')) { return undefined; }
+    if (playlistCache.removedKey !== removedKeyOf(removed)) { return undefined; }
+    return playlistCache.entries;
 }
 
 export function removeWallpaper(

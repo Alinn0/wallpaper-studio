@@ -36,7 +36,14 @@
                 <el-input v-model="wallpaperSearch" size="small" clearable :placeholder="t('searchWallpapers')" />
                 <el-button size="small" type="primary" :title="t('randomWallpaper')" @click="onRandomWallpaper"><el-icon><RefreshRight /></el-icon></el-button>
             </div>
-            <el-empty v-if="displayWallpapers.length === 0" :description="emptyDescription" :image-size="50" />
+            <div v-if="displayWallpapers.length === 0" class="playlist-empty">
+                <!-- 触发加载后就在空态原来的位置显示实时进度，而不是「没有壁纸」。 -->
+                <div v-if="isLoadingPlaylist" class="playlist-loading">
+                    <el-icon class="is-loading playlist-loading-icon"><Loading /></el-icon>
+                    <span>{{ displayLoadingDescription }}</span>
+                </div>
+                <el-empty v-else :description="emptyDescription" :image-size="50" />
+            </div>
             <div ref="listElement" class="wallpaper-list">
                 <div v-for="wallpaper in displayWallpapers" :key="wallpaper.path" class="wallpaper-row" :class="{ 'is-current': wallpaper.path === config.imagePath }" :data-pkg="sceneKey(wallpaper)" :ref="registerThumb" @click="onSelectWallpaper(wallpaper)" @mouseenter="onPkgHover(sceneKey(wallpaper))" @contextmenu.prevent="onRowContextMenu($event, wallpaper.path)">
                     <video
@@ -129,7 +136,22 @@ const emptyDescription = computed(() => {
     return t('wallpaperPlaylistEmpty');
 });
 
+const isLoadingPlaylist = computed(() =>
+    state.sourceMode === 'wallpaper' && (state.wallpaperLoading || !state.wallpaperLoadedOnce)
+);
+
+const displayLoadingDescription = computed(() => {
+    if (!isLoadingPlaylist.value) { return ''; }
+    // 总数还没盘出来时显示 0/?，避免出现「0/0」这种像加载完了的文案。
+    const total = state.wallpaperTotal > 0 ? String(state.wallpaperTotal) : '?';
+    return t('wallpaperPlaylistLoading')
+        .replace('{loaded}', String(state.wallpaperLoaded))
+        .replace('{total}', total);
+});
+
 const displayWallpapers = computed<GalleryItem[]>(() => {
+    // 触发加载后清空旧列表：这一块只显示加载进度，加载完再由扩展推送新列表。
+    if (isLoadingPlaylist.value) { return []; }
     const source: GalleryItem[] = state.sourceMode === 'wallpaper'
         ? state.wallpaperPlaylist
             .filter(item => item.active)
@@ -511,6 +533,16 @@ onUnmounted(() => {
 .wallpaper-row.is-current { outline: 1px solid var(--studio-accent); }
 .wallpaper-preview { width: 72px; height: 40px; object-fit: cover; border-radius: 4px; background: #000; flex: 0 0 auto; }
 .wallpaper-preview-empty { display: flex; align-items: center; justify-content: center; color: var(--vscode-descriptionForeground); }
+.playlist-loading-icon { font-size: 34px; color: var(--el-color-primary); }
+.playlist-loading {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 8px;
+    padding: 22px 0;
+    color: var(--vscode-descriptionForeground);
+    font-size: 13px;
+}
 .wallpaper-info { min-width: 0; flex: 1; display: flex; flex-direction: column; gap: 2px; }
 .wallpaper-info strong { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 

@@ -211,6 +211,46 @@ check('缺少模式记录时默认 wallpaper', sourceMode.getSourceMode() === 'w
 globalState.set('wallpaperStudioSourceMode', 'nonsense');
 check('非法模式值回落到默认', sourceMode.getSourceMode() === 'wallpaper');
 
+// 播放列表缓存：面板加载完整列表后，候选查询复用结果，不再同步重解析
+reset();
+globalState.set('wallpaperStudioSourceMode', 'wallpaper');
+const wallpaperEngine = require('../out/wallpaperEngine');
+const activeUser = (wallpaperEngine.resolveActiveWallpaperUser(configPath) || {}).user;
+wallpaperEngine.forgetWallpaperPlaylist();
+const parsedEntries = wallpaperEngine.readWallpaperPlaylist(configPath, [], activeUser);
+wallpaperEngine.rememberWallpaperPlaylist(configPath, [], activeUser, parsedEntries);
+check(
+    '条件一致时缓存命中同一份列表',
+    wallpaperEngine.readCachedWallpaperPlaylist(configPath, [], activeUser) === parsedEntries
+);
+check(
+    '移除列表变化后缓存失效',
+    wallpaperEngine.readCachedWallpaperPlaylist(configPath, [sceneA], activeUser) === undefined
+);
+check(
+    '用户变化后缓存失效',
+    wallpaperEngine.readCachedWallpaperPlaylist(configPath, [], 'Other') === undefined
+);
+// 只缓存一个项目：候选查询若仍走缓存，结果必然只有这一项。
+wallpaperEngine.rememberWallpaperPlaylist(configPath, [], activeUser, parsedEntries.filter(entry => entry.path === sceneA));
+const cachedCandidates = sourceMode.getCandidatesForMode();
+check(
+    '候选查询复用缓存而不是重新解析',
+    names(cachedCandidates).join(',') === 'scene-a.pkg',
+    names(cachedCandidates).join(',')
+);
+wallpaperEngine.forgetWallpaperPlaylist();
+check(
+    'forget 后缓存被清空',
+    wallpaperEngine.readCachedWallpaperPlaylist(configPath, [], activeUser) === undefined
+);
+reset();
+globalState.set('wallpaperStudioSourceMode', 'wallpaper');
+check(
+    '缓存清空后回到完整解析',
+    names(sourceMode.getCandidatesForMode()).join(',') === 'scene-a.pkg,scene-b.pkg'
+);
+
 // 历史键随模式同步
 reset();
 globalState.set('wallpaperStudioWallpaperEnabled', true);

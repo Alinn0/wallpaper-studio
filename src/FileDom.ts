@@ -1503,6 +1503,7 @@ export class FileDom {
     private getCss(): string {
         const opacity = Math.min(this.imageOpacity, 0.8);
         const { sizeModelVal, repeatVal, positionVal } = this.getCssStyles();
+        let backgroundPosition = positionVal;
 
         let rawPath = this.imagePath;
         const globalWindow = typeof globalThis !== 'undefined' ? (globalThis as any).window : undefined;
@@ -1563,6 +1564,18 @@ export class FileDom {
             `;
         }
 
+        const viewOverrides = getWallpaperPropertyOverrides(
+            getContext().globalState,
+            this.imagePath
+        );
+        const panX = Number(viewOverrides.wallpaperstudio_pan_x);
+        const panY = Number(viewOverrides.wallpaperstudio_pan_y);
+        if (Number.isFinite(panX) || Number.isFinite(panY)) {
+            const x = Number.isFinite(panX) ? Math.max(0, Math.min(200, panX)) : 100;
+            const y = Number.isFinite(panY) ? Math.max(0, Math.min(200, panY)) : 100;
+            backgroundPosition = `${x / 2}% ${y / 2}%`;
+        }
+
         return `
         body::before{
             content: "";
@@ -1573,7 +1586,7 @@ export class FileDom {
             position: absolute;
             background-size: ${sizeModelVal};
             background-repeat: ${repeatVal};
-            background-position: ${positionVal};
+            background-position: ${backgroundPosition};
             opacity:${opacity};
             background-image:url('${cssPath}');
             z-index: 2;

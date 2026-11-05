@@ -28,10 +28,12 @@ import {
     WallpaperProperty,
     hasWallpaperConfig,
     readRemovedWallpapers,
-    readWallpaperPlaylist,
     getWallpaperProjectProperties,
     getWallpaperProjectDeclaration,
     removeWallpaper,
+    readWallpaperPlaylistAsync,
+    rememberWallpaperPlaylist,
+    forgetWallpaperPlaylist,
     getWallpaperPropertyOverrides,
     setWallpaperProperty,
     setWallpaperProperties
@@ -56,6 +58,8 @@ import { isPathInsideFolder, normalizeComparablePath } from './pathComparison';
 import { clearRuntimeState } from './runtimeStore';
 
 const PUSH_DEBOUNCE_MS = 120;
+/** 播放列表加载进度的合并间隔：既能看清计数在走，又不会把消息队列刷满。 */
+const WALLPAPER_PROGRESS_INTERVAL_MS = 40;
 
 
 /** globalState keys the webview may write directly via `setGlobalState`. */
@@ -107,6 +111,14 @@ export class StudioViewProvider implements WebviewViewProvider {
     private wallpaperNotice = '';
     /** 已经弹过的提示文案，避免每次 pushState 都重复弹 toast。 */
     private notifiedWallpaperNotice = '';
+    /** 播放列表已触发读取但尚未完成时的进度。 */
+    private wallpaperLoading = false;
+    private wallpaperLoaded = 0;
+    private wallpaperTotal = 0;
+    /** 是否已经有过一次「读完了」的播放列表结果（首次加载期间必须一直显示加载态）。 */
+    private wallpaperLoadedOnce = false;
+    /** 进度消息按帧合并用的定时器。 */
+    private wallpaperProgressTimer?: ReturnType<typeof setTimeout>;
     /** 合并启动预热和 Webview 首次打开时对同一份播放列表的并发读取。 */
     private wallpaperSyncPromise?: Promise<void>;
     /** 图库页按需加载；首页首屏不发送大量列表数据。 */
@@ -311,6 +323,7 @@ export class StudioViewProvider implements WebviewViewProvider {
                     };
                 }).filter(item => !removedFolderImages.has(item.path));
             }
+
         } catch {
             folderImages = [];
             folderImagesTotal = 0;
@@ -369,6 +382,19 @@ export class StudioViewProvider implements WebviewViewProvider {
                     wallpaperConfigPath: this.wallpaperConfigPath,
                     // 播放列表为空的原因（只在 wallpaper 模式有意义）。
                     wallpaperNotice: wallpaperMode ? this.wallpaperNotice : '',
+                    // 加载态不能挂在 wallpaperMode 上：配置刚切换/读取中时它会短暂为 false，
+                    // 面板就会把「正在加载」误判成「没有壁纸」。
+                    // 首次加载还没出结果时也必须算加载中：否则解析开始前那几帧会推
+                    // 一条「loading=false + 空列表」的状态，面板闪一下「没有壁纸」。
+                    // 首次读盘还没出结果时也必须算加载中：否则解析开始前那几帧会推
+                    // 一条「loading=false + 空列表」的状态，面板闪一下「没有壁纸」。
+                    wallpaperLoading: this.wallpaperLoading
+                        || (!this.wallpaperLoadedOnce && this.currentSourceMode() === 'wallpaper'),
+                    // 面板据此区分「还没读过」和「读到了但真的没有壁纸」，
+                    // 首次读盘期间一律显示加载态，不会闪一下「没有壁纸」。
+                    wallpaperLoadedOnce: this.wallpaperLoadedOnce,
+                    wallpaperLoaded: this.wallpaperLoaded,
+                    wallpaperTotal: this.wallpaperTotal,
                     // 首页不需要完整播放列表。只在用户打开图库后构造 URI、属性和媒体信息，
                     // 避免首屏把几百个项目交给 Webview 的 Vue 响应式系统。
                     wallpaperPlaylist: this.galleryRequested ? this.wallpaperEntries.map(entry => ({
@@ -384,6 +410,37 @@ export class StudioViewProvider implements WebviewViewProvider {
                 }
             }
         });
+    }
+
+    /**
+     * 推送播放列表加载进度。
+     *
+     * 必须是**节流**而不是防抖：解析循环每一项都会调用一次，如果每次都把待发的
+     * 定时器清掉重排，连续调用永远等不到那 40ms，面板就会一直停在 0/总数，
+     * 直到结束时才突然跳到总数。
+     */
+    private pushWallpaperLoadingProgress(force = false): void {
+        if (!this.view) { return; }
+        const post = () => {
+            this.wallpaperProgressTimer = undefined;
+            void this.view?.webview.postMessage({
+                type: 'wallpaper-loading',
+                loading: this.wallpaperLoading,
+                loaded: this.wallpaperLoaded,
+                total: this.wallpaperTotal
+            });
+        };
+        if (force) {
+            if (this.wallpaperProgressTimer) {
+                clearTimeout(this.wallpaperProgressTimer);
+                this.wallpaperProgressTimer = undefined;
+            }
+            post();
+            return;
+        }
+        // 已有待发的定时器就不要动它：等它到点把最新的计数发出去。
+        if (this.wallpaperProgressTimer) { return; }
+        this.wallpaperProgressTimer = setTimeout(post, WALLPAPER_PROGRESS_INTERVAL_MS);
     }
 
     /** 把扩展侧保存的缩略图推给面板（面板重新打开时直接复用，不重新渲染）。 */
@@ -553,7 +610,7 @@ export class StudioViewProvider implements WebviewViewProvider {
 
     /** Refresh the current Studio data without switching to the legacy gallery view. */
     public refresh(): void {
-        this.pushState();
+        this.pushWallpaperLoadingProgress();
     }
 
     /**
@@ -571,14 +628,24 @@ export class StudioViewProvider implements WebviewViewProvider {
         const msg: WebviewMessage = value;
         switch (msg.type) {
             case 'ready':
-                await this.syncWallpaperPlaylist();
                 this.pushState();
-                this.notifyWallpaperNotice();
+                void this.syncWallpaperPlaylist().then(() => {
+                    this.pushState();
+                    this.notifyWallpaperNotice();
+                });
                 void this.pushThumbnails();
                 return;
 
             case 'loadGallery':
                 this.galleryRequested = true;
+                // 加载期间清空旧列表：面板只显示加载进度，避免旧数据看起来像"已经加载完"。
+                this.wallpaperLoading = this.sourceMode === 'wallpaper';
+                this.wallpaperLoaded = 0;
+                this.wallpaperTotal = 0;
+                if (this.wallpaperLoading) {
+                    this.pushWallpaperLoadingProgress(true);
+                }
+                this.pushState();
                 await this.syncWallpaperPlaylist();
                 this.pushState();
                 return;
@@ -921,6 +988,10 @@ export class StudioViewProvider implements WebviewViewProvider {
         this.wallpaperUser = '';
         this.wallpaperNotice = '';
         this.notifiedWallpaperNotice = '';
+        this.wallpaperLoading = false;
+        this.wallpaperLoaded = 0;
+        this.wallpaperTotal = 0;
+        this.wallpaperLoadedOnce = false;
         this.wallpaperConfigPath = DEFAULT_WALLPAPER_CONFIG;
         this.wallpaperConfigEnabled = true;
         this.sourceMode = DEFAULT_SOURCE_MODE;
@@ -1040,10 +1111,17 @@ export class StudioViewProvider implements WebviewViewProvider {
 
     private async syncWallpaperPlaylistImpl(force = false): Promise<void> {
         this.wallpaperNotice = '';
+        this.wallpaperLoading = true;
+        this.wallpaperLoaded = 0;
+        this.wallpaperTotal = 0;
+        // 立刻让面板进入加载态（此时总数还没盘出来，显示 0/?），
+        // 否则「没有壁纸」的空态会一直挂到解析结束。
+        this.pushWallpaperLoadingProgress(true);
         try {
             if (!fs.existsSync(this.wallpaperConfigPath)) {
                 this.wallpaperEntries = [];
                 this.wallpaperUser = '';
+                forgetWallpaperPlaylist();
                 return;
             }
 
@@ -1051,7 +1129,10 @@ export class StudioViewProvider implements WebviewViewProvider {
             const active = resolveActiveWallpaperUser(this.wallpaperConfigPath, stored);
             // 换用户等于换整个播放列表，项目元数据缓存也得一起丢。
             if (active && active.user !== this.wallpaperUser) { force = true; }
-            if (force) { clearWallpaperProjectCache(); }
+            if (force) {
+                clearWallpaperProjectCache();
+                forgetWallpaperPlaylist();
+            }
 
             this.wallpaperUser = active?.user || '';
             if (this.wallpaperUser && this.wallpaperUser !== stored) {
@@ -1059,26 +1140,48 @@ export class StudioViewProvider implements WebviewViewProvider {
             }
 
                 this.wallpaperEntries = this.wallpaperUser
-                ? readWallpaperPlaylist(
+                ? await readWallpaperPlaylistAsync(
                     this.wallpaperConfigPath,
                     readRemovedWallpapers(this.ctx.globalState),
-                    this.wallpaperUser
+                    this.wallpaperUser,
+                    (loaded, total) => {
+                        this.wallpaperLoaded = loaded;
+                        this.wallpaperTotal = total;
+                        // 每项都上报；pushWallpaperLoadingProgress 内部按帧合并。
+                        // 第一项（loaded=0）用来第一时间把总数告诉面板。
+                        this.pushWallpaperLoadingProgress(loaded === 0);
+                    }
                 )
                 : [];
             // 找不到当前用户（账号被换掉 / 删掉）或该用户播放列表为空，都要明确提示，
             // 而不是让面板停在"什么都没有"的状态里让用户自己猜。
             if (!this.wallpaperEntries.length) {
+                forgetWallpaperPlaylist();
                 this.wallpaperNotice = this.wallpaperUser
                     ? `Wallpaper 播放列表为空：当前用户「${this.wallpaperUser}」没有壁纸，请在 Wallpaper Engine 的播放列表里面添加壁纸。`
                     : '没有找到当前用户在 config.json 里的播放列表，请在 Wallpaper Engine 的播放列表里面添加壁纸。';
             } else {
                 // 列表恢复了就允许下次空列表时重新提示。
                 this.notifiedWallpaperNotice = '';
+                // 随机 / 上一张 / 轮播的候选查询复用这份结果，不再同步重解析。
+                rememberWallpaperPlaylist(
+                    this.wallpaperConfigPath,
+                    readRemovedWallpapers(this.ctx.globalState),
+                    this.wallpaperUser,
+                    this.wallpaperEntries
+                );
             }
         } catch (error) {
             this.wallpaperEntries = [];
+            forgetWallpaperPlaylist();
             this.wallpaperNotice = '读取 Wallpaper 播放列表失败，请检查 config.json 是否完整。';
             console.error('[WallpaperStudio] Failed to sync Wallpaper Engine playlist:', error);
+        } finally {
+            // 只清标记，不在这里推送：调用方紧接着会 pushState，
+            // 那份 state 同时带上新列表和 loading=false，面板不会先看到空列表。
+            this.wallpaperLoading = false;
+            this.wallpaperLoaded = this.wallpaperTotal;
+            this.wallpaperLoadedOnce = true;
         }
     }
 
