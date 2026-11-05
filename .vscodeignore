@@ -25,9 +25,25 @@ node_modules/@vscode/vsce/**
 node_modules/@vscode/vsce-sign/**
 node_modules/@vscode/vsce-sign-win32-x64/**
 node_modules/@vscode/test-electron/**
-# mediabunny 的入口全在 dist/，src/ 是源码副本（67 个文件 / 1.8 MB）
-node_modules/mediabunny/src/**
-# 文档与 sourcemap 对运行时无用
+# webwallgl 的浏览器包已内联 mediabunny：global.min.js 自带 demux 与解码，
+# 运行时只读取 webwallgl.global.min.js，mediabunny 整包与 ESM 入口都不需要
+node_modules/mediabunny/**
+node_modules/webwallgl/webwallgl.mjs
+node_modules/webwallgl/*.d.ts
+node_modules/webwallgl/imgs/**
+# 文档、类型声明、源码副本与 sourcemap 对运行时无用
 node_modules/**/*.map
-node_modules/**/README.md
-node_modules/**/CHANGELOG.md
+node_modules/**/*.d.ts
+node_modules/**/*.md
+node_modules/**/*.html
+node_modules/async-mutex/es6/**
+# 依赖附带的测试、示例与元数据文件
+node_modules/**/test/**
+node_modules/**/tests/**
+node_modules/**/example/**
+node_modules/**/examples/**
+node_modules/@vscode/sudo-prompt/test*.js
+node_modules/retry/Makefile
+node_modules/retry/equation.gif
+node_modules/retry/.travis.yml
+node_modules/retry/.npmignore
