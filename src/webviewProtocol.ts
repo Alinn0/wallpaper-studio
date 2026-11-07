@@ -29,6 +29,7 @@ export type ActionTypeValue = typeof ActionType[keyof typeof ActionType];
 
 export type WebviewMessage =
     | { type: 'ready' }
+    | { type: 'refresh' }
     | { type: 'loadGallery' }
     | { type: 'runAction'; action: number; path?: string }
     | { type: 'setConfig'; key: string; value: unknown }

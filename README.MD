@@ -2,7 +2,7 @@
 
 **在你的 VS Code 背景里渲染图片、视频与 Wallpaper Engine 场景包。**
 
-扩展 ID：`Alinn.wallpaper-studio`　版本：`1.0.0`　许可证：MIT
+扩展 ID：`Alin0907.wallpaper-studio`　版本：`1.0.2`　许可证：MIT
 
 > 中文名「壁纸工作室」。这是一个独立项目，**不是** `background-cover` 的官方版本，
 > 详见下方[与 background-cover 的关系](#与-background-cover-的关系)。
@@ -37,7 +37,7 @@ Wallpaper Studio **脱胎于** [AShujiao/vscode-background-cover](https://github
 
 | 项目 | background-cover（上游） | Wallpaper Studio（本项目） |
 |---|---|---|
-| 扩展 ID | `manasxx.background-cover` | `Alinn.wallpaper-studio` |
+| 扩展 ID | `manasxx.background-cover` | `Alin0907.wallpaper-studio` |
 | 面板名称 | Background Cover Studio | 壁纸工作室 / Wallpaper Studio |
 | 图标 | 上游自带 | 自绘（Material Symbols `wallpaper` 字形 + 渐变底） |
 | 内核产物 | `css-background-cover.css` / `js-background-cover.js` | `css-wallpaper-studio.css` / `js-wallpaper-studio.js` |
@@ -81,6 +81,10 @@ Wallpaper Engine。Wallpaper Engine 是 Kristjan Skutta 的产品，与本项目
 
 ## 功能特性
 
+同版本性能更新（1.0.2）：场景切换先保留旧画面，再用静态帧覆盖重建间隙；当前工作区的首帧缓存可在下次恢复时先显示。图库按可见行渲染，后台预览会取消过期任务。首次遇到新场景仍需要解析与上传贴图，实际首帧耗时取决于场景和显卡。
+
+壁纸列表首次进入时读取，之后切换标签页或重新打开面板会复用已完成的结果，配置文件、账号或移除名单变化时再读取。顶部刷新与「重新读取配置」可强制更新；仅修改 project.json 时请使用「重新读取配置」。重新加载整个 VS Code 窗口后仍需首次读取一次。
+
 | 能力 | 说明 |
 |---|---|
 | 图片背景 | png / jpg / webp / gif / bmp / svg 等 |
@@ -111,10 +115,10 @@ Wallpaper Engine。Wallpaper Engine 是 Kristjan Skutta 的产品，与本项目
 
 | 项目 | 要求 |
 |---|---|
-| VS Code | `^1.38.0` 及以上 |
+| VS Code | `^1.60.0` 及以上 |
 | 操作系统 | Windows / macOS / Linux（本文以 Windows 为例） |
 | 权限 | 首次应用补丁需**管理员**权限 |
-| 构建插件 | Node.js 18+（开发机为 v24）、npm 9+ |
+| 构建插件 | Node.js `^20.19.0` 或 `>=22.12.0`（本项目验证版本为 24）、npm 9+ |
 
 > 使用插件本身不需要 Node，只有自己构建才需要。
 
@@ -125,12 +129,12 @@ Wallpaper Engine。Wallpaper Engine 是 Kristjan Skutta 的产品，与本项目
 ### 从 VSIX 安装（推荐）
 
 **图形界面**：扩展面板（`Ctrl+Shift+X`）→ 右上角 `…` → **从 VSIX 安装…** → 选择
-`wallpaper-studio-1.0.0.vsix` → 完成后 **重载窗口**。
+`wallpaper-studio-1.0.2.vsix` → 完成后 **重载窗口**。
 
 **命令行**：
 
 ```powershell
-code --install-extension ".\wallpaper-studio-1.0.0.vsix" --force
+code --install-extension ".\releases\current\wallpaper-studio-1.0.2.vsix" --force
 ```
 
 ### 首次运行
@@ -202,7 +206,7 @@ code --install-extension ".\wallpaper-studio-1.0.0.vsix" --force
 | 窗口背景 | 「每个窗口独立」；关闭则所有窗口共用一张（透明度/模糊度始终统一） |
 | 尺寸模式 | 填充 / 平铺 / 拉伸 / 居中 / 原始尺寸（多种对齐） |
 | 混合模式 | 自动（跟随主题）/ 正片叠底 / 变亮 |
-| 打开缓存目录 | 打开 `globalStorage/Alinn.wallpaper-studio` |
+| 打开缓存目录 | 打开 `globalStorage/Alin0907.wallpaper-studio` |
 | 清除所有缓存与配置 | 二次确认，清空最近记录、移除名单、壁纸配置项、缩略图与插件设置 |
 
 ---
@@ -351,9 +355,17 @@ code --install-extension ".\wallpaper-studio-1.0.0.vsix" --force
 |---|---|
 | 共享设置（透明度/模糊度/自动轮播/尺寸/混合模式等） | `%USERPROFILE%\.wallpaper-studio\settings.json` |
 | 当前背景与窗口/工作区运行状态 | `%USERPROFILE%\.wallpaper-studio\runtime.json` |
-| 缩略图缓存 / 场景预览页 | `<VS Code User>/globalStorage/Alinn.wallpaper-studio/` |
+| 缩略图缓存 / 场景预览页 | `<VS Code User>/globalStorage/Alin0907.wallpaper-studio/` |
+| 桌面端场景包副本 | `<VS Code appRoot>/out/vs/workbench/wallpaper-studio-assets/`（同一内容复用；`.pkg` 必须位于桌面协议允许的资源根目录） |
+| 场景包哈希索引 | `~/.wallpaper-studio/scene-assets/.sources/`（源文件改变后重新计算） |
+| 连续加载首帧 | 工作台 localStorage，按工作区 / 场景 / 属性隔离，最多 8 项 |
 | 移除名单 / 逐壁纸配置 / 最近使用 | VS Code `globalState` |
 | 背景样式与加载器 | `<VS Code 安装目录>/resources/app/out/vs/workbench/css-wallpaper-studio.css`、`js-wallpaper-studio.js` |
+
+共享偏好由插件面板维护，默认值以 `src/settingsStore.ts` 为准。`settings.json` 的
+`version: 3` 和 `runtime.json` 的 `version: 1` 是数据结构版本，与扩展版本 `1.0.2`
+分开维护，无需改成扩展版本号。连续加载、预览帧率和缓存策略自动生效，无需在
+VS Code `settings.json` 添加旧的 `wallpaperStudio.*` 配置；现有壁纸路径和偏好继续保留。
 
 ### 后台保活（自动）
 
@@ -416,8 +428,9 @@ code --install-extension ".\wallpaper-studio-1.0.0.vsix" --force
 ### 前置
 
 ```powershell
-node -v      # >= 18
-npm.cmd install
+node -v      # ^20.19.0 或 >=22.12.0
+npm.cmd ci
+npm.cmd --prefix webview ci
 ```
 
 > Windows 下建议用 `npm.cmd`，避免 PowerShell 执行策略拦截 `npm.ps1`。
@@ -439,21 +452,35 @@ npm.cmd install
 │   └── backgroundSoftWrite.ts # 软写入保活
 ├── webview/                   # Vue 3 + Element Plus 面板（Vite 构建）
 ├── resources/                 # 场景预览页、图标
-├── scripts/                   # 回归测试脚本
+├── scripts/                   # 构建、安装、清理与回归测试
+├── docs/                      # planning/ 计划待办、progress/ 执行记录、reviews/ 审查
+├── releases/                  # current/ 当前包、archive/ 历史及回退包
 ├── out/                       # tsc 产物（打包用）
 └── webview-dist/              # Vite 产物（单文件 index.html）
 ```
 
+开发文档：[计划与待办](docs/planning/计划书.md) · [执行进度与验收](docs/progress/进度书.md) · [代码审查](docs/reviews/code-review-2026-11-07.md)。
+原任务书已合并到计划书和进度书；后续仅维护这两份文档。
+
+依赖与编译产物已在资源管理器中隐藏，可在 .vscode/settings.json 的 files.exclude 中恢复显示。
+安装包归档规则见 [releases/README.md](releases/README.md)。
+
 ### 常用命令
+
+在 Task Explorer 的工作区任务列表中运行 **一键编译并安装插件**；也可按 `Ctrl+Shift+B` 或使用 VS Code 的「任务: 运行任务」。该任务会依次清理产物、
+构建面板、编译宿主、打包并覆盖安装到当前 VS Code。版本和包名从 package.json 读取，
+完整流程内联在 `.vscode/tasks.json` 中，不依赖单独的安装脚本；清理和构建沿用项目的 npm package 流程。
+安装包输出到 releases/current/。构建失败会停止安装；成功后执行 `Developer: Reload Window` 生效。
 
 | 命令 | 作用 |
 |---|---|
 | `npm.cmd run compile` | TypeScript 编译到 `out/` |
+| `npm.cmd run build` | 构建面板并编译宿主，F5 与打包共用 |
 | `npm.cmd run watch` | 增量编译（调试用） |
 | `npm.cmd run build:webview` | 构建 Vue 面板 |
-| `npm.cmd run watch:webview` | 面板热更新 |
+| `npm.cmd run watch:webview` | 监听面板源码并写入 `webview-dist/`，完成后重载面板 |
 | `npm.cmd run test:unit` | 编译 + 全部回归测试 |
-| `npm.cmd run package` | 打包 VSIX（自动先构建面板再编译） |
+| `npm.cmd run package` | 打包到 releases/current/（自动先构建面板再编译） |
 
 ### 标准重构流程
 
@@ -462,7 +489,7 @@ npm.cmd run build:webview    # 改了 webview/
 npm.cmd run compile          # 改了 src/
 npm.cmd run test:unit        # 跑测试
 npm.cmd run package          # 打包
-code --install-extension ".\wallpaper-studio-1.0.0.vsix" --force
+code --install-extension ".\releases\current\wallpaper-studio-1.0.2.vsix" --force
 # 重载窗口生效
 ```
 
@@ -471,9 +498,11 @@ code --install-extension ".\wallpaper-studio-1.0.0.vsix" --force
 ### 调试（不打包）
 
 1. 用 VS Code 打开本仓库
-2. 按 `F5` → **Run Extension**（会自动 `npm: watch`）
-3. 在开发宿主窗口里验证；扩展侧改动在调试面板点 **重启**
-4. 面板改动另开终端 `npm.cmd run watch:webview`，重载面板
+2. 按 `F5` → **Run Extension**（自动执行 `npm: build`，确保宿主和面板都已更新）
+3. 持续修改宿主时另开终端 `npm.cmd run watch`；编译完成后在调试面板点 **重启**
+4. 持续修改面板时另开终端 `npm.cmd run watch:webview`，构建完成后重载面板。
+   面板使用打包后的单文件 HTML，Vite 开发服务器不会更新该文件。
+5. F5 的 **Regression Tests** 或任务 **npm: test:unit** 执行现有回归脚本，测试数据使用临时目录。
 
 ### 回归测试
 
@@ -488,11 +517,15 @@ code --install-extension ".\wallpaper-studio-1.0.0.vsix" --force
 | `test-soft-write.js` | 软写入与旧会话清理（9 条断言） |
 | `test-new-features.js` | CSS / 补丁 / 场景相关产物断言 |
 | `test-wallpaper-pkg.js` | `.pkg` 探测与场景输入 |
+| `test-gallery-loading.js` | 图库加载与缓存 |
+| `test-playlist-progress.js` | 播放列表进度与请求时序 |
+| `test-review-regressions.js` | 持久化失败、并发写入与异步竞态 |
+| `test-performance.js` | 连续交接、缓存、预览取消与虚拟列表 |
 
 ### 安装位置（排查用）
 
 ```
-%USERPROFILE%\.vscode\extensions\alinn.wallpaper-studio-<版本>\
+%USERPROFILE%\.vscode\extensions\alin0907.wallpaper-studio-<版本>\
 ```
 
 ---
@@ -500,7 +533,7 @@ code --install-extension ".\wallpaper-studio-1.0.0.vsix" --force
 ## 卸载与还原
 
 ```powershell
-code --uninstall-extension Alinn.wallpaper-studio
+code --uninstall-extension Alin0907.wallpaper-studio
 ```
 
 卸载脚本会尝试还原被修改的 workbench 文件（`.bak` 备份）。若目录需要管理员权限，
@@ -522,7 +555,7 @@ code --uninstall-extension Alinn.wallpaper-studio
 
 ```powershell
 Remove-Item -Recurse -Force "$env:USERPROFILE\.wallpaper-studio"
-Remove-Item -Recurse -Force "$env:APPDATA\Code\User\globalStorage\Alinn.wallpaper-studio"
+Remove-Item -Recurse -Force "$env:APPDATA\Code\User\globalStorage\Alin0907.wallpaper-studio"
 ```
 
 ---
@@ -536,7 +569,7 @@ Remove-Item -Recurse -Force "$env:APPDATA\Code\User\globalStorage\Alinn.wallpape
 **1. 创建 Publisher**
 
 打开 <https://marketplace.visualstudio.com/manage> → 用 Microsoft 账号登录 →
-**Create publisher**，ID 填 `Alinn`（必须与 `package.json` 的 `publisher` 一致）。
+**Create publisher**，ID 填 `Alin0907`（必须与 `package.json` 的 `publisher` 一致）。
 "Publisher" 只是自取的名字，没有审核、不收费。
 
 **2. 生成 PAT**
@@ -559,7 +592,7 @@ cd "E:\Study\Vscode For Wallpaper Engine"
 ```
 
 `vscode:prepublish` 会自动执行 `clean → build:webview → compile`，无需手动构建。
-已有 VSIX 想直接上传：`vsce publish --packagePath .\wallpaper-studio-1.0.0.vsix`。
+已有 VSIX 想直接上传：`vsce publish --packagePath .\releases\current\wallpaper-studio-1.0.2.vsix`。
 
 ### 不发布也能分发
 
@@ -567,7 +600,7 @@ cd "E:\Study\Vscode For Wallpaper Engine"
 |---|---|
 | VSIX | 分发 `wallpaper-studio-1.0.0.vsix`，对方执行 `code --install-extension xxx.vsix --force` |
 | GitHub Releases | 把 VSIX 挂到 Release，用户手动下载安装 |
-| Open VSX | `npx ovsx publish .\wallpaper-studio-1.0.0.vsix -p <token>`（VSCodium / Cursor） |
+| Open VSX | `npx ovsx publish .\releases\current\wallpaper-studio-1.0.2.vsix -p <token>`（VSCodium / Cursor） |
 
 ### 常见报错
 

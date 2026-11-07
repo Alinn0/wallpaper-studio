@@ -15,6 +15,24 @@ interface ThumbnailRecord {
 }
 
 let memory: Record<string, ThumbnailRecord> | null = null;
+let lastUsedAt = 0;
+function nextUsedAt(): number {
+    lastUsedAt = Math.max(Date.now(), lastUsedAt + 1);
+    return lastUsedAt;
+}
+const MAX_MEMORY_ENTRIES = 300;
+const MAX_MEMORY_CHARS = 12_000_000;
+
+function pruneMemory() {
+    const cache = load();
+    let count = 0;
+    let chars = 0;
+    for (const [key, entry] of Object.entries(cache).sort((a, b) => b[1].usedAt - a[1].usedAt)) {
+        if (++count > MAX_MEMORY_ENTRIES || chars + entry.value.length > MAX_MEMORY_CHARS) {
+            delete cache[key];
+        } else { chars += entry.value.length; }
+    }
+}
 /** 写回扩展侧的通道（由 App.vue 注入），用于跨 VS Code 重启保留缩略图。 */
 let reporter: ((key: string, value: string) => void) | undefined;
 /** Reactive signal for views that display a cached thumbnail. */
@@ -41,8 +59,9 @@ export function hydrateThumbnails(data: Record<string, string> | undefined): voi
     for (const [key, value] of Object.entries(data)) {
         if (!key || !value) { continue; }
         if (cache[key]?.value) { continue; }
-        cache[key] = { value, usedAt: base + (index += 1) };
+        cache[key] = { value, usedAt: base - (index += 1) };
     }
+    pruneMemory();
     thumbnailRevision.value++;
 }
 
@@ -56,13 +75,14 @@ export function getThumbnail(key: string): string {
     const record = load()[key];
     if (!record?.value) { return ''; }
     // 命中时只更新内存中的时间戳；延迟落盘避免连续读取时反复序列化整个缓存。
-    record.usedAt = Date.now();
+    record.usedAt = nextUsedAt();
     return record.value;
 }
 
 export function setThumbnail(key: string, value: string): void {
     if (!key || !value) { return; }
-    load()[key] = { value, usedAt: Date.now() };
+    load()[key] = { value, usedAt: nextUsedAt() };
+    pruneMemory();
     thumbnailRevision.value++;
     try { reporter?.(key, value); } catch { /* 通道未就绪时忽略 */ }
 }

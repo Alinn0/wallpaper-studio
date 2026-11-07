@@ -1,9 +1,57 @@
-out
-node_modules
+# Dependencies (root and Webview); keep both package-lock.json files
+node_modules/
+
+# Generated builds and development caches
+/out/
+/webview-dist/
+/webview/dist/
+*.tsbuildinfo
+.cache/
+.vite/
+.eslintcache
+.stylelintcache
+
+# Test artifacts
 .vscode-test/
+coverage/
+.nyc_output/
+test-results/
+playwright-report/
+
+# Local release packages; retain directory placeholders and instructions
 *.vsix
-webview/node_modules
-webview/dist
-webview-dist
-.claude/
+/releases/**
+!/releases/**/
+!/releases/README.md
+!/releases/**/.gitkeep
+
+# Shared VS Code configuration is part of the project
+/.vscode/*
+!/.vscode/tasks.json
+!/.vscode/launch.json
+!/.vscode/settings.json
+
+# Machine-local settings and credentials; sample env files remain trackable
+.env
+.env.*
+!.env.example
+!.env.*.example
+/.claude/
+/.codex/
+/.idea/
+/.history/
+
+# Logs, temporary files, backups and OS metadata
 *.log
+*.tmp
+*.bak
+*.swp
+*.swo
+*~
+/tmp/
+/temp/
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# Keep src/, webview source/config, resources/, scripts/, docs/ and licenses.

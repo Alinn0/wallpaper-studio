@@ -50,12 +50,18 @@ const inflight = new Map<string, Promise<string | null>>();
 
 interface PreviewJob {
     key: string;
+    cacheKey: string;
+    priority: boolean;
+    controller: AbortController;
+    cancelled: boolean;
     properties?: Record<string, unknown>;
     project?: unknown;
     resolve: (outcome: RenderOutcome) => void;
 }
 const queue: PreviewJob[] = [];
 let queueRunning = false;
+let activeJob: PreviewJob | null = null;
+let frameGeneration = 0;
 
 let pageUri = '';
 let pageNonce = '';
@@ -98,8 +104,8 @@ function withTimeout<T>(promise: Promise<T>, ms: number, fallback: T): Promise<T
  *
  * 返回空串表示就绪，否则是失败原因。
  */
-async function waitForRenderer(): Promise<string> {
-    const el = await ensureFrame();
+async function waitForRenderer(signal: AbortSignal): Promise<string> {
+    const el = await ensureFrame(signal);
     if (!el || !el.contentWindow) {
         return pageError
             ? `扩展未能准备场景预览页：${pageError}`
@@ -236,9 +242,10 @@ async function loadPageHtml(uri: string): Promise<string> {
     return pageHtml;
 }
 
-async function ensureFrame(): Promise<HTMLIFrameElement | null> {
+async function ensureFrame(signal: AbortSignal): Promise<HTMLIFrameElement | null> {
     const uri = await requestPageUri();
-    if (!uri) { return null; }
+    if (!uri || signal.aborted) { return null; }
+    const generation = frameGeneration;
     if (frame) { return frame; }
     let html = '';
     try {
@@ -247,6 +254,7 @@ async function ensureFrame(): Promise<HTMLIFrameElement | null> {
         pageError = error instanceof Error ? error.message : String(error);
         return null;
     }
+    if (signal.aborted || generation !== frameGeneration) { return null; }
     const el = document.createElement('iframe');
     el.setAttribute('sandbox', 'allow-scripts');
     el.setAttribute('aria-hidden', 'true');
@@ -291,14 +299,20 @@ function toCloneable<T>(value: T | undefined): T | undefined {
 }
 
 async function renderOnce(
-    key: string,
-    properties?: Record<string, unknown>,
-    project?: unknown
+    job: PreviewJob
 ): Promise<RenderOutcome> {
+    const { key, properties, project } = job;
     currentError = '';
     // 先握手再投递：渲染器没就绪就 postMessage，等于把字节丢进一个还没挂监听器的
     // 窗口，等再久也等不到首帧。握手失败直接重建 iframe，让下一次尝试干净重来。
-    const readyError = await waitForRenderer();
+    let abortReady: (() => void) | undefined;
+    const aborted = new Promise<string>(resolve => {
+        abortReady = () => resolve('cancelled');
+        job.controller.signal.addEventListener('abort', abortReady, { once: true });
+    });
+    const readyError = await Promise.race([waitForRenderer(job.controller.signal), aborted]);
+    if (abortReady) { job.controller.signal.removeEventListener('abort', abortReady); }
+    if (job.cancelled) { return { dataUrl: null, error: '' }; }
     if (readyError) {
         recycleFrame();
         return { dataUrl: null, error: readyError };
@@ -311,11 +325,12 @@ async function renderOnce(
     let handedOff = false;
     try {
         // pkg 已经是扩展侧登记过的 webview URI（display 字段就是 asWebviewUri 产物），直接取原始字节。
-        const response = await fetch(key);
+        const response = await fetch(key, { signal: job.controller.signal });
         if (!response.ok) {
             return { dataUrl: null, error: `读取场景包失败（HTTP ${response.status}）` };
         }
         const buffer = await response.arrayBuffer();
+        if (job.cancelled) { return { dataUrl: null, error: '' }; }
         const token = nextToken();
         currentToken = token;
         const result = new Promise<string | null>(resolve => { currentResolve = resolve; });
@@ -356,7 +371,7 @@ async function renderOnce(
         if (dataUrl) { return { dataUrl, error: '' }; }
         return { dataUrl: null, error: currentError || '渲染器未返回画面' };
     } catch (error) {
-        return { dataUrl: null, error: error instanceof Error ? error.message : String(error) };
+        return { dataUrl: null, error: job.cancelled ? '' : error instanceof Error ? error.message : String(error) };
     } finally {
         // 握手成功但连投递都没走完（例如 fetch 抛错），说明 iframe 本身也不可靠了。
         if (!handedOff) { recycleFrame(); }
@@ -370,9 +385,14 @@ function runQueue() {
         try {
             while (queue.length) {
                 const job = queue.shift()!;
-                job.resolve(await renderOnce(job.key, job.properties, job.project));
+                if (job.cancelled) { continue; }
+                activeJob = job;
+                job.resolve(await renderOnce(job).catch(error => ({ dataUrl: null,
+                    error: job.cancelled ? '' : error instanceof Error ? error.message : String(error) })));
+                if (activeJob === job) { activeJob = null; }
             }
         } finally {
+            activeJob = null;
             queueRunning = false;
         }
     })();
@@ -420,10 +440,11 @@ function requestPreview(
     if (!key) { return Promise.resolve(null); }
     const properties = renderConfig?.properties;
     const project = renderConfig?.project;
+    const cacheKey = key + propertiesKey(properties);
+    if (priority) { cancelJobs(job => job.cacheKey !== cacheKey && (job.priority || job === activeJob)); }
     const { exact, base } = lookup(key, properties);
     if (exact) { return Promise.resolve(exact); }
 
-    const cacheKey = key + propertiesKey(properties);
     const existing = inflight.get(cacheKey);
     if (existing) { return existing; }
 
@@ -448,16 +469,20 @@ function enqueue(
     properties?: Record<string, unknown>,
     project?: unknown
 ): Promise<string | null> {
+    let job: PreviewJob;
     const task = new Promise<RenderOutcome>(resolve => {
         rendering[cacheKey] = true;
         attempts.set(cacheKey, (attempts.get(cacheKey) ?? 0) + 1);
+        job = { key, cacheKey, priority, controller: new AbortController(), cancelled: false,
+            properties: toCloneable(properties), project: toCloneable(project), resolve };
         if (priority) {
-            queue.unshift({ key, properties, project, resolve });
+            queue.unshift(job);
         } else {
-            queue.push({ key, properties, project, resolve });
+            queue.push(job);
         }
         runQueue();
     }).then(({ dataUrl, error }) => {
+        if (job.cancelled) { return null; }
         if (dataUrl) {
             cache[cacheKey] = dataUrl;
             setThumbnail(`scene:${cacheKey}`, dataUrl);
@@ -470,8 +495,10 @@ function enqueue(
         } else if (error) {
             errors[cacheKey] = error;
         }
-        rendering[cacheKey] = false;
-        inflight.delete(cacheKey);
+        if (inflight.get(cacheKey) === task) {
+            rendering[cacheKey] = false;
+            inflight.delete(cacheKey);
+        }
         return dataUrl;
     });
     inflight.set(cacheKey, task);
@@ -480,6 +507,8 @@ function enqueue(
 
 /** 释放离屏 iframe（回收 WebGL 上下文）；下次请求会重建。 */
 function releaseFrame() {
+    frameGeneration++;
+    resolveFrameReady?.();
     if (!frame) { return; }
     window.removeEventListener('message', onFrameMessage);
     finish(null);
@@ -488,6 +517,29 @@ function releaseFrame() {
     frameReadyPromise = null;
     resolveFrameReady = null;
     ready = false;
+}
+
+function cancelJobs(predicate: (job: PreviewJob) => boolean) {
+    const cancel = (job: PreviewJob) => {
+        if (job.cancelled || !predicate(job)) { return false; }
+        job.cancelled = true;
+        job.controller.abort();
+        inflight.delete(job.cacheKey);
+        attempts.set(job.cacheKey, Math.max(0, (attempts.get(job.cacheKey) || 1) - 1));
+        rendering[job.cacheKey] = false;
+        job.resolve({ dataUrl: null, error: '' });
+        return true;
+    };
+    for (let i = queue.length - 1; i >= 0; i--) {
+        if (cancel(queue[i])) { queue.splice(i, 1); }
+    }
+    if (activeJob && cancel(activeJob)) { releaseFrame(); }
+}
+
+if (typeof document !== 'undefined') {
+    document.addEventListener('visibilitychange', () => {
+        if (document.hidden) { cancelJobs(() => true); }
+    });
 }
 
 export function useScenePreview() {
@@ -511,6 +563,8 @@ export function useScenePreview() {
          * 渲染失败返回 null（同一个包最多尝试 MAX_ATTEMPTS 次）。
          */
         requestPreview,
+        cancelPriority() { cancelJobs(job => job.priority); },
+        cancelQueuedExcept(keys: Set<string>) { cancelJobs(job => !job.priority && !keys.has(job.key)); },
         /** 丢弃缓存（例如用户重新选择了同名文件）。 */
         invalidate(key?: string) {
             const keys = key ? [key] : Object.keys(cache);
@@ -526,11 +580,15 @@ export function useScenePreview() {
 
 /** webview 卸载时清掉模块级单例，避免残留旧 iframe 和缓存。 */
 export function disposeScenePreviewRuntime() {
+    cancelJobs(() => true);
     releaseFrame();
     Object.keys(cache).forEach(k => delete cache[k]);
     Object.keys(errors).forEach(k => delete errors[k]);
     attempts.clear();
-    queue.length = 0;
     pageHtml = '';
+    pageRequested = false;
+    pageAttempts = 0;
+    const waiters = pageWaiters;
     pageWaiters = [];
+    waiters.forEach(resolve => resolve());
 }

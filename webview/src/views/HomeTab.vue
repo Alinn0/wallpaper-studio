@@ -124,7 +124,7 @@
 </template>
 
 <script setup lang="ts">
-import { computed, ref, watch } from 'vue';
+import { computed, onMounted, onUnmounted, ref, watch } from 'vue';
 import { Picture, ArrowLeft, RefreshRight, Setting } from '@element-plus/icons-vue';
 import { useI18n } from '../composables/useI18n';
 import { useBridge } from '../composables/useBridge';
@@ -132,6 +132,7 @@ import { useScenePreview } from '../composables/useScenePreview';
 import { getThumbnail, setThumbnail, thumbnailRevision } from '../composables/useThumbnailCache';
 import { config, state, type WallpaperProperty } from '../composables/useStore';
 import { isVideoPath, isWallpaperPkgPath } from '../utils/media';
+import { mediaPathKey } from '../../../src/mediaTypes';
 
 const { t } = useI18n();
 const bridge = useBridge();
@@ -166,7 +167,7 @@ const displayUrl = computed(() => config.imagePathDisplay || '');
 const isWallpaperPkg = computed(() => isWallpaperPkgPath(config.imagePath));
 const isVideo = computed(() => isVideoPath(config.imagePath));
 const samePath = (a: string, b: string) =>
-    !!a && !!b && a.replace(/\\/g, '/').toLowerCase() === b.replace(/\\/g, '/').toLowerCase();
+    !!a && !!b && mediaPathKey(a) === mediaPathKey(b);
 
 const currentWallpaper = computed(() => {
     if (state.sourceMode === 'wallpaper') {
@@ -195,7 +196,7 @@ const projectProperties = computed<WallpaperProperty[]>(() =>
 );
 
 /** 当前壁纸的标识：用它判断"换壁纸了"，比路径比较更稳（大小写/斜杠差异）。 */
-const currentKey = computed(() => (config.imagePath || '').replace(/\\/g, '/').toLowerCase());
+const currentKey = computed(() => mediaPathKey(config.imagePath || ''));
 
 function readViewValue(key: string, min: number, max: number, fallback: number): number {
     const value = properties.value.find(property => property.key === key)?.value;
@@ -288,20 +289,28 @@ const previewThumbnail = computed(() => {
     if (isWallpaperPkg.value) {
         // The list stores scene frames by sceneSource (normally the package URI).
         // Keep the raw path fallback for caches created before URI normalization.
-        return getThumbnail(`scene:${config.imagePathDisplay}`)
+        return scenePreview.previewOf(config.imagePathDisplay, config.sceneRender?.properties)
             || getThumbnail(`scene:${path}`)
             || '';
     }
     return getThumbnail(`${isVideoPath(path) ? 'video' : 'image'}:${path}`) || '';
 });
 
-watch([currentKey, previewThumbnail], () => {
-    if (!isWallpaperPkg.value || !displayUrl.value || previewThumbnail.value) { return; }
-    isThumbnailGenerating.value = true;
-    void scenePreview.requestPreview(displayUrl.value, true, config.sceneRender).finally(() => {
-        isThumbnailGenerating.value = false;
-    });
-}, { immediate: true });
+let scenePreviewTimer: ReturnType<typeof setTimeout> | undefined;
+function scheduleCurrentPreview() {
+    if (scenePreviewTimer) { clearTimeout(scenePreviewTimer); }
+    scenePreview.cancelPriority();
+    if (document.hidden || !isWallpaperPkg.value || !displayUrl.value) { return; }
+    scenePreviewTimer = setTimeout(() => {
+        scenePreviewTimer = undefined;
+        isThumbnailGenerating.value = true;
+        void scenePreview.requestPreview(displayUrl.value, true, config.sceneRender).finally(() => {
+            isThumbnailGenerating.value = false;
+        });
+    }, 250);
+}
+watch([currentKey, displayUrl, () => JSON.stringify(config.sceneRender?.properties || {})], scheduleCurrentPreview, { immediate: true });
+onMounted(() => { document.addEventListener('visibilitychange', scheduleCurrentPreview); });
 
 const shortPath = computed(() => {
     const p = config.imagePath || '';
@@ -323,9 +332,9 @@ function onRandom() { bridge.post({ type: 'randomWallpaper' }); }
 function setGlobalConfig(key: 'opacity' | 'blur', value: number) {
     bridge.post({ type: 'setConfig', key, value });
 }
-function updateWallpaperProperty(key: string, value: unknown) {
-    if (!config.imagePath) { return; }
-    bridge.post({ type: 'setWallpaperProperty', path: config.imagePath, key, value });
+function updateWallpaperProperty(key: string, value: unknown, wallpaperPath = config.imagePath) {
+    if (!wallpaperPath) { return; }
+    bridge.post({ type: 'setWallpaperProperty', path: wallpaperPath, key, value });
 }
 
 function isHexColor(value: unknown): boolean {
@@ -384,11 +393,14 @@ function sliderStep(property: WallpaperProperty): number {
 const propertyTimers = new Map<string, ReturnType<typeof setTimeout>>();
 /** 滑块拖动时事件很密集，节流到 60ms 再落盘：既有实时感，又不会刷爆消息通道。 */
 function onPropertySliderInput(property: WallpaperProperty) {
-    const pending = propertyTimers.get(property.key);
+    const wallpaperPath = config.imagePath;
+    const value = property.value;
+    const timerKey = wallpaperPath + '\u0000' + property.key;
+    const pending = propertyTimers.get(timerKey);
     if (pending) { clearTimeout(pending); }
-    propertyTimers.set(property.key, setTimeout(() => {
-        propertyTimers.delete(property.key);
-        updateWallpaperProperty(property.key, property.value);
+    propertyTimers.set(timerKey, setTimeout(() => {
+        propertyTimers.delete(timerKey);
+        updateWallpaperProperty(property.key, value, wallpaperPath);
     }, 60));
 }
 
@@ -405,18 +417,28 @@ function onViewOffsetInput() {
     cameraPanY.value = clampRange(Number(cameraPanY.value), PAN_MIN, PAN_MAX);
     xyDirtyUntil = Date.now() + 1200;
     if (viewOffsetTimer) { clearTimeout(viewOffsetTimer); }
+    const wallpaperPath = config.imagePath;
+    const properties = {
+        wallpaperstudio_pan_x: cameraPanX.value,
+        wallpaperstudio_pan_y: cameraPanY.value
+    };
     viewOffsetTimer = setTimeout(() => {
-        if (!config.imagePath) { return; }
+        viewOffsetTimer = undefined;
         bridge.post({
             type: 'setWallpaperProperties',
-            path: config.imagePath,
-            properties: {
-                wallpaperstudio_pan_x: cameraPanX.value,
-                wallpaperstudio_pan_y: cameraPanY.value
-            }
+            path: wallpaperPath,
+            properties
         });
     }, 60);
 }
+onUnmounted(() => {
+    document.removeEventListener('visibilitychange', scheduleCurrentPreview);
+    if (scenePreviewTimer) { clearTimeout(scenePreviewTimer); }
+    scenePreview.cancelPriority();
+    propertyTimers.forEach(timer => clearTimeout(timer));
+    propertyTimers.clear();
+    if (viewOffsetTimer) { clearTimeout(viewOffsetTimer); }
+});
 </script>
 
 <style lang="scss" scoped>

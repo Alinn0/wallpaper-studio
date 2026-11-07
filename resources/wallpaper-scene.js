@@ -54,6 +54,66 @@
     let lastPointer;
     /** 最近一次生效的属性：setFit 会把 coverAlign 重置成居中，需要重新补上视角。 */
     let currentProperties = {};
+    let lastPoster = '';
+    let poster;
+    let posterTimer;
+    let mountChain = Promise.resolve();
+
+    function showPoster(value) {
+        if (!value) return;
+        if (posterTimer) clearTimeout(posterTimer);
+        if (!poster) {
+            poster = document.createElement('img');
+            poster.setAttribute('aria-hidden', 'true');
+            poster.style.cssText = 'position:fixed;inset:0;width:100%;height:100%;object-fit:fill;pointer-events:none;z-index:3';
+            document.body.appendChild(poster);
+        }
+        poster.style.transition = 'none';
+        poster.style.opacity = '1';
+        poster.src = value;
+    }
+
+    function dismissPoster(expectedGeneration) {
+        if (!poster) return;
+        const previous = poster;
+        previous.style.transition = window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches
+            ? 'none' : 'opacity 180ms ease';
+        previous.style.opacity = '0';
+        posterTimer = setTimeout(function() {
+            if (generation !== expectedGeneration || poster !== previous) return;
+            previous.remove();
+            poster = undefined;
+            posterTimer = undefined;
+        }, 200);
+    }
+
+    function capturePoster() {
+        const canvas = host.querySelector('canvas');
+        if (!canvas || !canvas.width || !canvas.height) return '';
+        const size = fitThumbSize(canvas.width, canvas.height);
+        const thumb = document.createElement('canvas');
+        thumb.width = size.width;
+        thumb.height = size.height;
+        const context = thumb.getContext('2d');
+        if (!context) return '';
+        context.drawImage(canvas, 0, 0, size.width, size.height);
+        return thumb.toDataURL('image/jpeg', 0.8);
+    }
+
+    function nextPaint() {
+        return new Promise(function(resolve) {
+            let done = false;
+            let timer;
+            function finish() { if (!done) { done = true; clearTimeout(timer); resolve(); } }
+            timer = setTimeout(finish, 120);
+            requestAnimationFrame(finish);
+        });
+    }
+
+    document.addEventListener('visibilitychange', function() {
+        if (!scene) return;
+        if (document.hidden) scene.pause(); else scene.resume();
+    });
 
     /** 缩略图尺寸：首页和列表共用，背景渲染不会走这条截图链路。 */
     var THUMB_MAX_WIDTH = 640;
@@ -157,17 +217,27 @@
             }
             token = '';
             currentProperties = {};
+            lastPoster = '';
+            if (posterTimer) clearTimeout(posterTimer);
+            if (poster) poster.remove();
+            poster = undefined;
             host.replaceChildren();
             return;
         }
         if (message.type !== 'load' || !message.bytes) return;
-        void loadScene(message);
+        const requestedGeneration = ++generation;
+        token = message.token;
+        // Serialize mounts: obsolete requests may finish, but cannot allocate a second live scene.
+        mountChain = mountChain.catch(function() {}).then(function() {
+            if (requestedGeneration !== generation) return;
+            return loadScene(message, requestedGeneration);
+        });
     });
 
     /**
      * 用 requestAnimationFrame 采样显示器实际刷新率，作为场景渲染的帧率上限，
      * 让动画尽量跑满屏幕刷新率（包括 60/120/144/165/240 Hz 及更高刷新率）。
-     * 采样不足时使用 360；正常情况下采样值来自浏览器的实际屏幕同步时钟。
+     * 采样不足时使用 60；背景上限 120，缩略图固定 24，减少同时初始化的 GPU 压力。
      */
     function detectRefreshRate() {
         if (refreshRatePromise) { return refreshRatePromise; }
@@ -194,7 +264,7 @@
                 return Math.max(24, Math.min(360, Math.round(1000 / median)));
             }
             timer = window.setTimeout(function() {
-                finish(samples.length >= 3 ? medianFps(samples) : 240);
+                finish(samples.length >= 3 ? medianFps(samples) : 60);
             }, 600);
             function tick(time) {
                 if (settled) { return; }
@@ -212,9 +282,13 @@
         return refreshRatePromise;
     }
 
-    async function loadScene(message) {
-        const currentGeneration = ++generation;
-        token = message.token;
+    async function loadScene(message, currentGeneration) {
+        const startedAt = performance.now();
+        if (!message.capture) {
+            let snapshot = lastPoster;
+            try { snapshot = capturePoster() || snapshot; } catch (e) { /* Preserve the previous cached frame. */ }
+            showPoster(snapshot);
+        }
         if (scene) {
             scene.destroy({ releasePkgCache: true });
             scene = undefined;
@@ -225,11 +299,9 @@
             if (!api || typeof api.mount !== 'function' || typeof api.bytesSource !== 'function') {
                 throw new Error('WebWallGL renderer failed to initialize.');
             }
-            // Mount immediately at the safe upper bound. Refresh-rate sampling
-            // takes several animation frames; waiting for it here leaves the
-            // scene iframe black during every VS Code reload. Tune the running
-            // instance once the real display rate has been measured.
-            const refreshRatePromise = detectRefreshRate();
+            // Mount immediately at 60 FPS without waiting for monitor sampling.
+            // Thumbnail work is capped at 24 FPS and never runs a second live scene.
+            const refreshRatePromise = message.capture ? Promise.resolve(24) : detectRefreshRate();
             const instance = await api.mount(host, {
                 source: api.bytesSource(
                     new Uint8Array(message.bytes),
@@ -240,7 +312,8 @@
                     'wallpaper-studio:' + message.key
                 ),
                 fit: 'cover',
-                fps: 360,
+                fps: message.capture ? 24 : 60,
+                mountTimeoutMs: 30000,
                 volume: 0,
                 scripts: true,
                 properties: message.properties || {},
@@ -257,14 +330,22 @@
             installFitGuard(instance);
             void refreshRatePromise.then(function(fps) {
                 if (currentGeneration === generation && token === message.token && scene === instance) {
-                    try { instance.setFps(fps); } catch (e) { /* renderer may be closing */ }
+                    try { instance.setFps(message.capture ? 24 : Math.min(120, fps)); } catch (e) { /* renderer may be closing */ }
                 }
             });
             // 补发挂载前收到的指针，首帧就能带正确的视差/鼠标跟随角度。
             if (lastPointer && !lastPointer.leave) {
                 try { instance.pushPointer(lastPointer.u, lastPointer.v, lastPointer.buttons, lastPointer.mods); } catch (e) { /* 忽略 */ }
             }
-            parent.postMessage({ type: 'scene-ready', token: token }, '*');
+            await nextPaint();
+            if (currentGeneration !== generation) return;
+            let firstPoster = '';
+            try { firstPoster = capturePoster(); } catch (e) { /* Readback is optional. */ }
+            if (firstPoster) lastPoster = firstPoster;
+            parent.postMessage({ type: 'scene-ready', token: token, poster: firstPoster,
+                mountMs: performance.now() - startedAt }, '*');
+            dismissPoster(currentGeneration);
+            if (document.hidden) instance.pause();
             if (message.capture) {
                 void captureFirstFrame(currentGeneration, message.token);
             }

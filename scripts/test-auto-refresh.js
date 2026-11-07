@@ -11,6 +11,7 @@
  * Run after compilation: node scripts/test-auto-refresh.js
  */
 'use strict';
+require('./test-env');
 
 const assert = require('assert').strict;
 const Module = require('module');
@@ -97,7 +98,7 @@ Module._load = originalLoad;
 const originalUpdateDom = PickList.prototype.updateDom;
 PickList.prototype.updateDom = async function () {
     appliedImages.push({ imagePath: this.imgPath, silent: this.silentApply, randUpdate: this.randUpdate });
-    return false;
+    return { applied: true, requiresReload: false };
 };
 
 const originalSetInterval = global.setInterval;

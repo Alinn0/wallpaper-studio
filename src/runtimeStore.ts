@@ -3,8 +3,9 @@ import * as os from 'os';
 import * as path from 'path';
 import { getContext } from './global';
 import * as lockfile from 'proper-lockfile';
+import { atomicWriteTextSync } from './atomicWrite';
 
-export const RUNTIME_FILE = path.join(os.homedir(), '.wallpaper-studio', 'runtime.json');
+export const RUNTIME_FILE = path.join(process.env.WALLPAPER_STUDIO_DATA_DIR || path.join(os.homedir(), '.wallpaper-studio'), 'runtime.json');
 
 export interface RuntimeState {
     version: number;
@@ -83,7 +84,7 @@ function readLegacyState(): RuntimeState {
 function persist(state: RuntimeState): boolean {
     try {
         fs.mkdirSync(path.dirname(RUNTIME_FILE), { recursive: true });
-        fs.writeFileSync(RUNTIME_FILE, JSON.stringify(state, null, 2), 'utf8');
+        atomicWriteTextSync(RUNTIME_FILE, JSON.stringify(state, null, 2));
         return true;
     } catch (error) {
         console.warn('[WallpaperStudio] Failed to persist runtime state:', error);
@@ -101,7 +102,6 @@ function ensureLoaded(): RuntimeState {
     }
     cache = readLegacyState();
     migrationChecked = true;
-    persist(cache);
     return cache;
 }
 
@@ -119,19 +119,17 @@ export function readRuntimeState(): RuntimeState {
 
 /** Mutate and persist runtime state. Failed writes are not reflected in the cache. */
 export async function updateRuntimeState(mutator: (state: RuntimeState) => void): Promise<boolean> {
-    const next = readRuntimeState();
-    mutator(next);
     try {
         fs.mkdirSync(path.dirname(RUNTIME_FILE), { recursive: true });
-        if (!fs.existsSync(RUNTIME_FILE)) {
-            fs.writeFileSync(RUNTIME_FILE, JSON.stringify(DEFAULT_RUNTIME, null, 2), 'utf8');
-        }
         const release = await lockfile.lock(RUNTIME_FILE, {
+            realpath: false,
             retries: { retries: 8, minTimeout: 25, maxTimeout: 250 },
             stale: 5000
         });
         try {
-            const latest = readDisk() || DEFAULT_RUNTIME;
+            const disk = readDisk();
+            if (!disk && fs.existsSync(RUNTIME_FILE)) { throw new Error('Runtime state is not valid JSON'); }
+            const latest = disk || normalize(cache || readLegacyState());
             mutator(latest);
             if (!persist(latest)) { return false; }
             cache = latest;
@@ -146,7 +144,6 @@ export async function updateRuntimeState(mutator: (state: RuntimeState) => void)
 }
 
 export async function clearRuntimeState(): Promise<boolean> {
-    cache = normalize(DEFAULT_RUNTIME);
     return updateRuntimeState(state => {
         Object.assign(state, normalize(DEFAULT_RUNTIME));
     });

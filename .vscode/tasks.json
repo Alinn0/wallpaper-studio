@@ -1,25 +1,126 @@
-// See https://go.microsoft.com/fwlink/?LinkId=733558
-// for the documentation about the tasks.json format
 {
     "version": "2.0.0",
     "tasks": [
         {
-            "type": "npm",
-            "script": "watch",
-            "problemMatcher": "$tsc-watch",
-            "isBackground": true,
-            "presentation": {
-                "reveal": "never"
+            "label": "npm: build",
+            "type": "shell",
+            "command": "npm",
+            "windows": {
+                "command": "npm.cmd"
             },
+            "args": [
+                "run",
+                "build"
+            ],
+            "problemMatcher": [
+                "$tsc"
+            ],
+            "group": "build"
+        },
+        {
+            "label": "一键编译并安装插件",
+            "type": "process",
+            "command": "powershell.exe",
+            "args": [
+                "-NoProfile",
+                "-NonInteractive",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-Command",
+                "$ErrorActionPreference = 'Stop'\n$projectRoot = (Get-Location).Path\n\ntry {\n    $package = Get-Content -LiteralPath (Join-Path $projectRoot 'package.json') -Raw -Encoding UTF8 | ConvertFrom-Json\n    $releaseDirectory = Join-Path $projectRoot 'releases/current'\n    New-Item -ItemType Directory -Path $releaseDirectory -Force | Out-Null\n    $vsix = Join-Path $releaseDirectory ($package.name + '-' + $package.version + '.vsix')\n    $npm = (Get-Command npm.cmd -ErrorAction Stop).Source\n\n    $codeCli = $null\n    if ($env:WALLPAPER_STUDIO_CODE_EXECUTABLE) {\n        $candidate = Join-Path (Split-Path -Parent $env:WALLPAPER_STUDIO_CODE_EXECUTABLE) 'bin/code.cmd'\n        if (Test-Path -LiteralPath $candidate -PathType Leaf) { $codeCli = $candidate }\n    }\n    if (-not $codeCli) { $codeCli = (Get-Command code.cmd -ErrorAction Stop).Source }\n\n    Push-Location -LiteralPath $projectRoot\n    try {\n        & $npm run package\n        if ($LASTEXITCODE -ne 0) { throw \"Build/package failed (exit $LASTEXITCODE). Installation skipped.\" }\n        if (-not (Test-Path -LiteralPath $vsix -PathType Leaf)) { throw \"VSIX was not generated: $vsix\" }\n\n        & $codeCli --install-extension $vsix --force\n        if ($LASTEXITCODE -ne 0) { throw \"Extension installation failed (exit $LASTEXITCODE).\" }\n        Write-Host \"Installed $($package.publisher).$($package.name)@$($package.version). Run Developer: Reload Window to activate.\"\n    } finally {\n        Pop-Location\n    }\n} catch {\n    [Console]::Error.WriteLine($_.Exception.Message)\n    exit 1\n}\n"
+            ],
+            "options": {
+                "cwd": "${workspaceFolder}",
+                "env": {
+                    "WALLPAPER_STUDIO_CODE_EXECUTABLE": "${execPath}"
+                }
+            },
+            "problemMatcher": [
+                "$tsc"
+            ],
             "group": {
                 "kind": "build",
                 "isDefault": true
-            }
+            },
+            "presentation": {
+                "reveal": "always",
+                "panel": "dedicated",
+                "clear": true
+            },
+            "detail": "完整编译安装流程内联于此任务：打包至 releases/current，成功后覆盖安装。可从 Task Explorer 或 Ctrl+Shift+B 直接运行。"
         },
         {
-            "type": "npm",
-            "script": "postinstall",
+            "label": "npm: watch",
+            "type": "shell",
+            "command": "npm",
+            "windows": {
+                "command": "npm.cmd"
+            },
+            "args": [
+                "run",
+                "watch"
+            ],
+            "problemMatcher": [
+                "$tsc-watch"
+            ],
+            "isBackground": true
+        },
+        {
+            "label": "npm: watch:webview",
+            "type": "shell",
+            "command": "npm",
+            "windows": {
+                "command": "npm.cmd"
+            },
+            "args": [
+                "run",
+                "watch:webview"
+            ],
             "problemMatcher": []
+        },
+        {
+            "label": "npm: test:unit",
+            "type": "shell",
+            "command": "npm",
+            "windows": {
+                "command": "npm.cmd"
+            },
+            "args": [
+                "run",
+                "test:unit"
+            ],
+            "problemMatcher": [
+                "$tsc"
+            ],
+            "group": "test"
+        },
+        {
+            "label": "npm: check",
+            "type": "shell",
+            "command": "npm",
+            "windows": {
+                "command": "npm.cmd"
+            },
+            "args": [
+                "run",
+                "check"
+            ],
+            "problemMatcher": []
+        },
+        {
+            "label": "npm: package",
+            "type": "shell",
+            "command": "npm",
+            "windows": {
+                "command": "npm.cmd"
+            },
+            "args": [
+                "run",
+                "package"
+            ],
+            "problemMatcher": [
+                "$tsc"
+            ]
         }
     ]
 }

@@ -108,7 +108,7 @@ import { useBridge } from './composables/useBridge';
 import { useI18n, setLocale, type Locale } from './composables/useI18n';
 import { applyState, brand, state } from './composables/useStore';
 import { clearThumbnailCache, hydrateThumbnails, setThumbnailReporter } from './composables/useThumbnailCache';
-import { useScenePreview } from './composables/useScenePreview';
+import { disposeScenePreviewRuntime } from './composables/useScenePreview';
 
 const { t, locale } = useI18n();
 const bridge = useBridge();
@@ -216,9 +216,7 @@ bridge.on('navigate', (data: any) => {
 // 扩展端「清除所有缓存与配置」之后要求面板也把本地缓存丢弃。
 bridge.on('purgeLocalCache', () => {
     clearThumbnailCache();
-    const scenePreview = useScenePreview();
-    scenePreview.invalidate();
-    scenePreview.releaseFrame();
+    disposeScenePreviewRuntime();
     userLocaleOverride.value = null;
     uiTheme.value = 'default';
     try {
@@ -228,7 +226,7 @@ bridge.on('purgeLocalCache', () => {
 });
 
 function onRefresh() {
-    bridge.post({ type: 'ready' });
+    bridge.post({ type: 'refresh' });
 }
 
 interface ToastItem { id: number; text: string; level: 'info' | 'warning' | 'error'; }
@@ -247,6 +245,8 @@ function pushToast(text: string, level: ToastItem['level'] = 'info') {
     }, 3000));
 }
 onUnmounted(() => {
+    disposeScenePreviewRuntime();
+    setThumbnailReporter(undefined);
     toastTimers.forEach(timer => clearTimeout(timer));
     toastTimers.clear();
 });

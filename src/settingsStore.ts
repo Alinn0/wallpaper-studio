@@ -1,7 +1,9 @@
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
-import { EventEmitter, Event } from 'vscode';
+import { Disposable, EventEmitter, Event } from 'vscode';
+import * as lockfile from 'proper-lockfile';
+import { atomicWriteTextSync } from './atomicWrite';
 
 /**
  * 扩展自己的全局设置存储。
@@ -16,7 +18,7 @@ import { EventEmitter, Event } from 'vscode';
  * 文件位置：`~/.wallpaper-studio/settings.json`（跨 profile、跨 workspace 共享）。
  */
 
-export const SETTINGS_DIR = path.join(os.homedir(), '.wallpaper-studio');
+export const SETTINGS_DIR = process.env.WALLPAPER_STUDIO_DATA_DIR || path.join(os.homedir(), '.wallpaper-studio');
 const SETTINGS_FILE = path.join(SETTINGS_DIR, 'settings.json');
 
 export interface AppSettings {
@@ -36,7 +38,7 @@ export interface AppSettings {
     seeded?: boolean;
 }
 
-/** 与旧版 package.json 的默认值保持一致。 */
+/** 共享偏好的唯一默认值来源；性能调度与派生缓存不写入用户偏好。 */
 export const DEFAULT_SETTINGS: AppSettings = {
     // 透明度/模糊度默认 0：壁纸默认原样显示，需要柔化时再由用户在 UI 里调。
     opacity: 0,
@@ -77,6 +79,8 @@ const SEEDABLE_KEYS = Object.keys(DEFAULT_SETTINGS).filter(
 
 let cache: AppSettings | null = null;
 const changeEmitter = new EventEmitter<string[]>();
+const externalChangeEmitter = new EventEmitter<string[]>();
+export const onDidChangeExternalSettings: Event<string[]> = externalChangeEmitter.event;
 
 /** 设置变化（参数是变化的键名）。 */
 export const onDidChangeSettings: Event<string[]> = changeEmitter.event;
@@ -181,7 +185,6 @@ function load(): AppSettings {
         }
         settings.version = SETTINGS_VERSION;
         cache = settings;
-        persist(settings);
         return settings;
     }
 
@@ -196,29 +199,12 @@ function load(): AppSettings {
         }
         settings.version = SETTINGS_VERSION;
         cache = settings;
-        persist(settings);
         return settings;
     }
 
-    // 老文件可能缺少后来新增的键（opacity / blur 等）：补齐并写回，
-    // 保证这些值一定存在于配置文件里，下次启动直接读取。
-    if (!hasAllKeys()) {
-        persist(settings);
-    }
-
+    settings.version = SETTINGS_VERSION;
     cache = settings;
     return settings;
-}
-
-/** 磁盘上的设置文件是否包含所有已声明的键。 */
-function hasAllKeys(): boolean {
-    let parsed: any;
-    try {
-        parsed = JSON.parse(fs.readFileSync(SETTINGS_FILE, 'utf8'));
-    } catch {
-        return true; // 读不到就不在这里处理，交由 load() 的首次写入分支。
-    }
-    return Object.keys(DEFAULT_SETTINGS).every(key => parsed?.[key] !== undefined);
 }
 
 /**
@@ -240,7 +226,7 @@ function reloadFromDisk(): AppSettings {
 function persist(settings: AppSettings): boolean {
     try {
         fs.mkdirSync(SETTINGS_DIR, { recursive: true });
-        fs.writeFileSync(SETTINGS_FILE, JSON.stringify(settings, null, 2), 'utf8');
+        atomicWriteTextSync(SETTINGS_FILE, JSON.stringify(settings, null, 2));
         return true;
     } catch (error) {
         console.warn('[WallpaperStudio] Failed to persist settings:', error);
@@ -250,15 +236,54 @@ function persist(settings: AppSettings): boolean {
 
 /** 读取一份当前设置的浅拷贝。 */
 /** 删除设置文件并回到全默认值（「清除所有缓存与配置」用）。 */
-export function resetSettings(): void {
-    cache = { ...DEFAULT_SETTINGS, seeded: true, version: SETTINGS_VERSION };
+export async function resetSettings(): Promise<void> {
+    await withSettingsLock(() => {
+        const next = { ...DEFAULT_SETTINGS, seeded: true, version: SETTINGS_VERSION };
+        if (!persist(next)) { throw new Error('Failed to reset settings'); }
+        cache = next;
+        changeEmitter.fire(Object.keys(DEFAULT_SETTINGS).filter(k => k !== 'seeded'));
+    });
+}
+
+async function withSettingsLock<T>(operation: () => T): Promise<T> {
+    fs.mkdirSync(SETTINGS_DIR, { recursive: true });
+    const release = await lockfile.lock(SETTINGS_FILE, {
+        realpath: false,
+        retries: { retries: 12, minTimeout: 25, maxTimeout: 250 },
+        stale: 5000
+    });
+    try { return operation(); } finally { await release(); }
+}
+
+/** External edits are parsed completely before replacing the live snapshot. */
+export function reloadExternalSettings(): void {
     try {
-        fs.rmSync(SETTINGS_FILE, { force: true });
-    } catch {
-        // 文件不存在或不可写：下次写盘时会重建。
+        JSON.parse(fs.readFileSync(SETTINGS_FILE, 'utf8'));
+        const previous = { ...load() };
+        const next = reloadFromDisk();
+        const changed = Object.keys(DEFAULT_SETTINGS).filter(key =>
+            (previous as any)[key] !== (next as any)[key]);
+        if (changed.length) {
+            changeEmitter.fire(changed);
+            externalChangeEmitter.fire(changed);
+        }
+    } catch (error) {
+        console.warn('[WallpaperStudio] External settings update skipped:', error);
     }
-    persist(cache);
-    changeEmitter.fire(Object.keys(DEFAULT_SETTINGS).filter(k => k !== 'seeded'));
+}
+
+/** Polling also survives atomic rename and unavailable native file watchers. */
+export function startSettingsSync(): Disposable {
+    const listener = () => reloadExternalSettings();
+    load();
+    fs.watchFile(SETTINGS_FILE, { interval: 750, persistent: false }, listener);
+    void withSettingsLock(() => {
+        if (fs.existsSync(SETTINGS_FILE)) { JSON.parse(fs.readFileSync(SETTINGS_FILE, 'utf8')); }
+        const next = { ...reloadFromDisk() };
+        if (!persist(next)) { throw new Error('Failed to initialize settings'); }
+        cache = next;
+    }).catch(error => console.warn('[WallpaperStudio] Settings initialization failed:', error));
+    return { dispose: () => fs.unwatchFile(SETTINGS_FILE, listener) };
 }
 
 export function readSettings(): AppSettings {
@@ -331,13 +356,21 @@ export class AppConfig {
         const coerced = coerce(name, value);
         if (coerced === undefined) { return; }
         // 多窗口共享同一个文件：先合并磁盘上的最新内容，再写回自己这一项。
-        const settings = reloadFromDisk();
-        if ((settings as any)[name] === coerced) { return; }
-        (settings as any)[name] = coerced;
-        // Do not broadcast or apply a value that was not actually persisted.
-        // Otherwise the UI and the next VS Code process would disagree.
-        if (!persist(settings)) { return; }
-        changeEmitter.fire([name as string]);
+        await withSettingsLock(() => {
+            const previous = { ...load() };
+            if (fs.existsSync(SETTINGS_FILE)) { JSON.parse(fs.readFileSync(SETTINGS_FILE, 'utf8')); }
+            const settings = reloadFromDisk();
+            const next = { ...settings, [name]: coerced };
+            if ((settings as any)[name] !== coerced && !persist(next)) {
+                throw new Error(`Failed to save setting: ${name}`);
+            }
+            cache = next;
+            const changed = Object.keys(DEFAULT_SETTINGS).filter(key =>
+                (previous as any)[key] !== (next as any)[key]);
+            if (changed.length) { changeEmitter.fire(changed); }
+            const external = changed.filter(key => key !== name);
+            if (external.length) { externalChangeEmitter.fire(external); }
+        });
     }
 }
 

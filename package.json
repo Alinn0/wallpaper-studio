@@ -2,7 +2,7 @@
   "name": "wallpaper-studio",
   "displayName": "Wallpaper Studio",
   "description": "Render images, videos and Wallpaper Engine scene packages as your VS Code background. / 用图片、视频与 Wallpaper Engine 场景包作为 VS Code 背景。",
-  "version": "1.0.1",
+  "version": "1.0.2",
   "publisher": "Alin0907",
   "engines": {
     "vscode": "^1.60.0"
@@ -110,17 +110,18 @@
   },
   "homepage": "https://github.com/Alinn/wallpaper-studio#readme",
   "scripts": {
-    "vscode:prepublish": "npm run clean && npm run build:webview && npm run compile",
+    "vscode:prepublish": "npm run clean && npm run build",
     "clean": "node scripts/clean.js",
     "vscode:uninstall": "node ./out/uninstall",
     "compile": "tsc -p ./",
+    "build": "npm run build:webview && npm run compile",
     "watch": "tsc -watch -p ./",
-    "package": "vsce package",
-    "build:webview": "cd webview && npm install --silent && npm run build",
-    "watch:webview": "cd webview && npm run dev",
+    "package": "vsce package --out releases/current/",
+    "build:webview": "npm --prefix webview run build",
+    "watch:webview": "npm --prefix webview run build -- --watch",
     "test:newfeatures": "npm run compile && node scripts/test-new-features.js",
     "test:autorefresh": "npm run compile && node scripts/test-auto-refresh.js",
-    "test:unit": "npm run compile && node scripts/test-config-update.js && node scripts/test-auto-refresh.js && node scripts/test-source-isolation.js && node scripts/test-wallpaper-user.js && node scripts/test-playlist-progress.js && node scripts/test-gallery-loading.js && node scripts/test-soft-write.js && node scripts/test-new-features.js && node scripts/test-wallpaper-pkg.js",
+    "test:unit": "npm run compile && node scripts/run-tests.js",
     "check": "tslint -p ./"
   },
   "devDependencies": {
@@ -137,7 +138,6 @@
   },
   "dependencies": {
     "@vscode/sudo-prompt": "^9.3.2",
-    "async-mutex": "^0.5.0",
     "fs-extra": "^11.2.0",
     "proper-lockfile": "^4.1.2",
     "webwallgl": "^3.0.0"

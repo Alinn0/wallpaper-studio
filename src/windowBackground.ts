@@ -4,6 +4,7 @@ import { ConfigurationTarget, env, workspace, WorkspaceConfiguration } from 'vsc
 import { getContext, onDidChangeGlobalState } from './global';
 import { getAppConfig } from './settingsStore';
 import { readRuntimeState, updateRuntimeState } from './runtimeStore';
+import { normalizeComparablePath } from './pathComparison';
 
 const WORKSPACE_IMAGES_KEY = 'wallpaperStudio.workspaceImages';
 // 全局兜底图。以前这个角色由 settings.json 的 wallpaperStudio.imagePath 承担，
@@ -62,7 +63,10 @@ export function getWorkspaceKey(): string | undefined {
         return NO_WORKSPACE_KEY;
     }
 
-    const normalized = path.normalize(folder.uri.fsPath).replace(/\\+/g, '/').replace(/\/+$/, '').toLowerCase();
+    let normalized = normalizeComparablePath(folder.uri.fsPath).replace(/\\+/g, '/').replace(/\/+$/, '');
+    if (folder.uri.scheme && folder.uri.scheme !== 'file') {
+        normalized = `${folder.uri.scheme}://${folder.uri.authority || ''}/${normalized}`;
+    }
     return shortHash(normalized);
 }
 
@@ -134,6 +138,8 @@ export function resolveCurrentImagePath(globalFallback?: string): string {
 export interface SetImageOptions {
     /** false 表示只更新当前窗口的内存态，不写入 runtime.json。 */
     persist?: boolean;
+    workspaceKey?: string;
+    shouldPersist?: () => boolean;
 }
 
 /**
@@ -142,14 +148,18 @@ export interface SetImageOptions {
  */
 async function persistLevelValue(
     workspaceKey: string,
-    value: string | number
+    value: string | number,
+    options: SetImageOptions = {}
 ): Promise<void> {
-    const workspaceHash = getWorkspaceKey();
+    const workspaceHash = options.workspaceKey ?? getWorkspaceKey();
+    let committed = false;
     const saved = await updateRuntimeState(runtime => {
+        if (options.shouldPersist && !options.shouldPersist()) { return; }
         const workspaceMap: Record<string, string | number> = workspaceKey === WORKSPACE_IMAGES_KEY
             ? runtime.workspaceImages
             : workspaceKey === WORKSPACE_OPACITY_KEY ? runtime.workspaceOpacity : runtime.workspaceBlur;
         if (workspaceHash) {
+            committed = true;
             delete workspaceMap[workspaceHash];
             workspaceMap[workspaceHash] = value;
             const prunedWorkspaceMap = pruneRecords(workspaceMap, workspaceHash);
@@ -158,11 +168,14 @@ async function persistLevelValue(
             });
         }
     });
-    if (!saved) { return; }
+    if (!saved) { throw new Error('Failed to save background state'); }
+    if (!committed) { return; }
+    volatileImagePath = undefined;
     onDidChangeGlobalState.fire();
 }
 
 export async function setCurrentImagePath(imagePath: string, options: SetImageOptions = {}): Promise<void> {
+    if (options.shouldPersist && !options.shouldPersist()) { return; }
     const value = imagePath || '';
     if (options.persist === false) {
         volatileImagePath = value;
@@ -171,9 +184,7 @@ export async function setCurrentImagePath(imagePath: string, options: SetImageOp
     }
 
     // 有显式持久化写入时，内存态的临时图就失去意义了。
-    volatileImagePath = undefined;
-
-    await persistLevelValue(WORKSPACE_IMAGES_KEY, value);
+    await persistLevelValue(WORKSPACE_IMAGES_KEY, value, options);
 }
 
 /**

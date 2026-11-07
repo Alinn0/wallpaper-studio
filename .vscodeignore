@@ -1,49 +1,43 @@
-.vscode/**
-.vscode-test/**
-.claude/**
-*.vsix
-out/test/**
-out/**/*.map
-scripts/**
-src/**
-webview/node_modules/**
-webview/src/**
-webview/index.html
-webview/package-lock.json
-webview/package.json
-webview/tsconfig.json
-webview/tsconfig.node.json
-webview/vite.config.ts
-计划书.md
-进度书.md
-.gitignore
-tsconfig.json
-tslint.json
-# 只保留运行时必需的依赖：类型声明、打包工具、测试宿主都不进 VSIX
-node_modules/@types/**
-node_modules/@vscode/vsce/**
-node_modules/@vscode/vsce-sign/**
-node_modules/@vscode/vsce-sign-win32-x64/**
-node_modules/@vscode/test-electron/**
-# webwallgl 的浏览器包已内联 mediabunny：global.min.js 自带 demux 与解码，
-# 运行时只读取 webwallgl.global.min.js，mediabunny 整包与 ESM 入口都不需要
-node_modules/mediabunny/**
-node_modules/webwallgl/webwallgl.mjs
-node_modules/webwallgl/*.d.ts
-node_modules/webwallgl/imgs/**
-# 文档、类型声明、源码副本与 sourcemap 对运行时无用
-node_modules/**/*.map
-node_modules/**/*.d.ts
-node_modules/**/*.md
-node_modules/**/*.html
-node_modules/async-mutex/es6/**
-# 依赖附带的测试、示例与元数据文件
-node_modules/**/test/**
-node_modules/**/tests/**
-node_modules/**/example/**
-node_modules/**/examples/**
-node_modules/@vscode/sudo-prompt/test*.js
-node_modules/retry/Makefile
-node_modules/retry/equation.gif
-node_modules/retry/.travis.yml
-node_modules/retry/.npmignore
+# Default deny: only the runtime files below belong in the VSIX.
+# VSCE negations are unconditional includes, not ordered like Git rules.
+# Do not add broad !node_modules/** or !resources/** rules.
+**
+
+# Extension manifest, usage information and license notices
+!package.json
+!README.MD
+!CHANGELOG.md
+!LICENSE
+!THIRD_PARTY_NOTICES.md
+
+# Current host output is flat. Add subdirectory rules if src/ is reorganized.
+!out/*.js
+
+# Single-file Webview and scene runtime resources
+!webview-dist/index.html
+!resources/wallpaper-scene.html
+!resources/wallpaper-scene.js
+!resources/wallpaper-studio.png
+!resources/activity-bar.svg
+!resources/light/home.svg
+!resources/light/refresh.svg
+!resources/dark/home.svg
+!resources/dark/refresh.svg
+
+# Runtime dependency closure for package-lock.json.
+# Recheck this list and extracted-package loading whenever dependencies change.
+!node_modules/@vscode/sudo-prompt/{index.js,package.json,LICENSE}
+!node_modules/fs-extra/{package.json,LICENSE}
+!node_modules/fs-extra/lib/**/*.js
+!node_modules/proper-lockfile/{index.js,package.json,LICENSE}
+!node_modules/proper-lockfile/lib/**/*.js
+!node_modules/graceful-fs/{graceful-fs.js,polyfills.js,legacy-streams.js,clone.js,package.json,LICENSE}
+!node_modules/jsonfile/{index.js,utils.js,package.json,LICENSE}
+!node_modules/universalify/{index.js,package.json,LICENSE}
+!node_modules/retry/{index.js,package.json,License}
+!node_modules/retry/lib/*.js
+!node_modules/signal-exit/{index.js,signals.js,package.json,LICENSE.txt}
+
+# Scene renderer reads the browser bundle and resolves webwallgl/package.json.
+# mediabunny is already bundled; ESM, types, images and examples are not loaded.
+!node_modules/webwallgl/{webwallgl.global.min.js,package.json,LICENSE}

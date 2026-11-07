@@ -11,7 +11,7 @@ import {
 } from './wallpaperEngine';
 import { getContext } from './global';
 import { getAppConfig } from './settingsStore';
-import { expandPathVariables } from './pathUtil';
+import { expandPathVariables, isSupportedMedia } from './pathUtil';
 import { isPathInsideFolder, samePath } from './pathComparison';
 
 /**
@@ -104,12 +104,12 @@ export function getWallpaperCandidates(): string[] {
 /** 目录媒体候选：目录内未被移除的文件。 */
 export function getFolderCandidates(): string[] {
     const folder = currentFolder();
-    if (!folder || !fs.existsSync(folder) || !fs.statSync(folder).isDirectory()) { return []; }
     try {
+        if (!folder || !fs.statSync(folder).isDirectory()) { return []; }
         const removed = getContext().globalState.get<string[]>('wallpaperStudioFolderRemoved', []) || [];
-        return fs.readdirSync(folder)
-            .filter(name => /\.(svg|png|jpe?g|gif|bmp|webp|jfif|mp4|webm|ogg|mov|pkg)$/i.test(name))
-            .map(name => path.join(folder, name))
+        return fs.readdirSync(folder, { withFileTypes: true })
+            .filter(entry => entry.isFile() && isSupportedMedia(entry.name))
+            .map(entry => path.join(folder, entry.name))
             .filter(full => !removed.some(item => samePath(item, full)));
     } catch {
         return [];

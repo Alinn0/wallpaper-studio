@@ -1,6 +1,7 @@
 import * as crypto from 'crypto';
 import * as fs from 'fs';
 import * as path from 'path';
+import { atomicWriteTextSync } from './atomicWrite';
 
 const WEBWALLGL_PLACEHOLDER = '__WALLPAPER_STUDIO_WEBWALLGL_BASE64__';
 const SCENE_PLACEHOLDER = '__WALLPAPER_STUDIO_SCENE_BASE64__';
@@ -79,11 +80,60 @@ export function buildWallpaperSceneHtml(template: string, webwallglRuntime: stri
     );
 }
 
-export async function copyWallpaperScenePackage(sourcePath: string, assetDirectory: string): Promise<string> {
-    const hash = await hashFile(sourcePath);
+const packageHashes = new Map<string, { signature: string; hash: Promise<string> }>();
+
+export async function copyWallpaperScenePackage(
+    sourcePath: string,
+    assetDirectory: string,
+    indexDirectory = path.join(assetDirectory, '.sources')
+): Promise<string> {
+    const stat = await fs.promises.stat(sourcePath);
+    const signature = `${stat.size}:${stat.mtimeMs}:${stat.ctimeMs}`;
+    const key = path.resolve(sourcePath);
+    const indexPath = path.join(indexDirectory, crypto.createHash('sha256').update(key).digest('hex') + '.json');
+    let writeIndex = false;
+    let cached = packageHashes.get(key);
+    if (!cached || cached.signature !== signature) {
+        let persistedHash = '';
+        try {
+            const record = JSON.parse(await fs.promises.readFile(indexPath, 'utf8'));
+            if (record.signature === signature && /^[a-f0-9]{64}$/.test(record.hash)) { persistedHash = record.hash; }
+        } catch { /* Cold source or invalid cache: hash the package once. */ }
+        writeIndex = !persistedHash;
+        cached = { signature, hash: persistedHash ? Promise.resolve(persistedHash) : hashFile(sourcePath) };
+        if (packageHashes.size >= 64) { packageHashes.delete(packageHashes.keys().next().value as string); }
+        packageHashes.set(key, cached);
+    }
+    let hash: string;
+    try { hash = await cached.hash; } catch (error) {
+        packageHashes.delete(key);
+        throw error;
+    }
     await fs.promises.mkdir(assetDirectory, { recursive: true });
     const assetPath = path.join(assetDirectory, `wallpaper-scene-${hash}.pkg`);
-    await fs.promises.copyFile(sourcePath, assetPath);
+    try {
+        if ((await fs.promises.stat(assetPath)).size === stat.size) {
+            if (writeIndex) {
+                try { atomicWriteTextSync(indexPath, JSON.stringify({ signature, hash })); } catch { /* Cache metadata is optional. */ }
+            }
+            return assetPath;
+        }
+    } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== 'ENOENT') { throw error; }
+    }
+    const temporary = `${assetPath}.${process.pid}.${crypto.randomBytes(6).toString('hex')}.tmp`;
+    try {
+        await fs.promises.copyFile(sourcePath, temporary);
+        const after = await fs.promises.stat(sourcePath);
+        if (`${after.size}:${after.mtimeMs}:${after.ctimeMs}` !== signature) {
+            packageHashes.delete(key);
+            throw new Error('Scene package changed while preparing it; retry the wallpaper.');
+        }
+        await fs.promises.rename(temporary, assetPath);
+        try { atomicWriteTextSync(indexPath, JSON.stringify({ signature, hash })); } catch { /* Live asset is still usable. */ }
+    } finally {
+        await fs.promises.unlink(temporary).catch(() => undefined);
+    }
     return assetPath;
 }
 
@@ -93,6 +143,9 @@ export interface WallpaperSceneInputs {
     sceneScript: string;
 }
 
+const inputCache = new Map<string, { signature: string; value: Promise<WallpaperSceneInputs> }>();
+const pageCache = new WeakMap<WallpaperSceneInputs, { html: string; stamp: string }>();
+
 /**
  * 读取生成场景页所需的三个输入：iframe 模板、WebWallGL 运行时（全局构建）与
  * iframe 内运行脚本。workbench 注入与 Studio 预览页共用这一份，保证两处画面
@@ -101,12 +154,15 @@ export interface WallpaperSceneInputs {
 export async function loadWallpaperSceneInputs(extensionPath: string): Promise<WallpaperSceneInputs> {
     const runtimePath = path.join(require.resolve('webwallgl/package.json'), '..', 'webwallgl.global.min.js');
     const resourcesPath = path.join(extensionPath, 'resources');
-    const [runtime, template, sceneScript] = await Promise.all([
-        fs.promises.readFile(runtimePath, 'utf8'),
-        fs.promises.readFile(path.join(resourcesPath, 'wallpaper-scene.html'), 'utf8'),
-        fs.promises.readFile(path.join(resourcesPath, 'wallpaper-scene.js'), 'utf8')
-    ]);
-    return { template, runtime: patchWallpaperSceneRuntime(runtime), sceneScript };
+    const files = [runtimePath, path.join(resourcesPath, 'wallpaper-scene.html'), path.join(resourcesPath, 'wallpaper-scene.js')];
+    const stats = await Promise.all(files.map(file => fs.promises.stat(file)));
+    const signature = stats.map(stat => `${stat.size}:${stat.mtimeMs}:${stat.ctimeMs}`).join('|');
+    const cached = inputCache.get(extensionPath);
+    if (cached && cached.signature === signature) { return cached.value; }
+    const value = Promise.all(files.map(file => fs.promises.readFile(file, 'utf8')))
+        .then(([runtime, template, sceneScript]) => ({ template, runtime: patchWallpaperSceneRuntime(runtime), sceneScript }));
+    inputCache.set(extensionPath, { signature, value });
+    try { return await value; } catch (error) { inputCache.delete(extensionPath); throw error; }
 }
 
 /**
@@ -116,10 +172,14 @@ export async function buildWallpaperScenePage(
     extensionPath: string
 ): Promise<{ html: string; stamp: string }> {
     const inputs = await loadWallpaperSceneInputs(extensionPath);
+    const cached = pageCache.get(inputs);
+    if (cached) { return cached; }
     const stamp = crypto.createHash('sha256')
         .update(inputs.template).update('\0')
         .update(inputs.runtime).update('\0')
         .update(inputs.sceneScript)
         .digest('hex');
-    return { html: buildWallpaperSceneHtml(inputs.template, inputs.runtime, inputs.sceneScript), stamp };
+    const result = { html: buildWallpaperSceneHtml(inputs.template, inputs.runtime, inputs.sceneScript), stamp };
+    pageCache.set(inputs, result);
+    return result;
 }

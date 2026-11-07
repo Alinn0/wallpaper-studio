@@ -21,12 +21,13 @@ import { setContext } from './global';
 import { CUSTOM_JS_FILE_PATH, collectStaleWindowCssFiles, detectPatchState } from './FileDom';
 import { StudioViewProvider } from './StudioViewProvider';
 import { ensureWorkspaceRecord, hasCurrentImageRecord, resolveCurrentImagePath, setCurrentBlur, setCurrentOpacity } from './windowBackground';
-import { getAppConfig, onDidChangeSettings } from './settingsStore';
+import { getAppConfig, onDidChangeSettings, onDidChangeExternalSettings, startSettingsSync } from './settingsStore';
 import { clearLegacyImageRecords, pruneOrphanedWorkspaceRecords } from './runtimeStore';
 
 
 export function activate(context: ExtensionContext) {
 	setContext(context);
+	context.subscriptions.push(startSettingsSync());
 	void (async () => {
 		await clearLegacyImageRecords();
 		await ensureWorkspaceRecord();
@@ -68,7 +69,7 @@ export function activate(context: ExtensionContext) {
 					console.warn('[WallpaperStudio] failed to restore missing loader:', error);
 				}
 			} else if (hasImage && patchOutdated) {
-				const ex: Extension<any> | undefined = extensions.getExtension('Alinn.wallpaper-studio');
+				const ex: Extension<any> | undefined = extensions.getExtension('Alin0907.wallpaper-studio');
 				const extensionVersion: string = ex ? ex.packageJSON['version'] : '';
 				window.showInformationMessage(
 					`WallpaperStudio ${extensionVersion || ''}：检测到背景补丁缺失或版本过旧，需要重新应用。是否立即执行？ / WallpaperStudio ${extensionVersion || ''}: Background patch is missing or outdated. Apply it now?`,
@@ -89,7 +90,8 @@ export function activate(context: ExtensionContext) {
 					// Only the first window without any persisted background gets
 					// an initial random wallpaper. Existing window/workspace/global
 					// records are restored above and are never randomized on startup.
-					void PickList.initializeBackground();
+					void PickList.initializeBackground().catch(error =>
+						console.warn('[WallpaperStudio] Initial background skipped:', error));
 				}
 			}
 		}
@@ -115,6 +117,17 @@ export function activate(context: ExtensionContext) {
 			// 切换独立/共用模式：重新应用一次，让本窗口写到新的目标 CSS 文件，
 			// 并把注入端的地址复位。其余窗口各自收到同一事件后自行处理。
 			void PickList.applyCurrentBackground();
+		}
+	}));
+	context.subscriptions.push(onDidChangeExternalSettings(changed => {
+		if (!changed.includes('perWindowBackground') &&
+			changed.some(key => ['opacity', 'blur', 'sizeModel', 'blendModel'].includes(key))) {
+			const appearanceOnly = changed.every(key => key === 'opacity' || key === 'blur');
+			if (appearanceOnly) {
+				void PickList.applyCurrentAppearance(getAppConfig()).then(applied => {
+					if (!applied) { PickList.needAutoUpdate(getAppConfig()); }
+				}).catch(error => console.warn('[WallpaperStudio] Appearance update skipped:', error));
+			} else { PickList.needAutoUpdate(getAppConfig()); }
 		}
 	}));
 	if (workspace.onDidChangeWorkspaceFolders) {
@@ -156,7 +169,7 @@ export function activate(context: ExtensionContext) {
 	context.subscriptions.push(
 		commands.registerCommand('wallpaperStudio.refreshEntry', () => {
 			commands.executeCommand('setContext', 'wallpaperStudio.mode', 'menu');
-			studioViewProvider.refresh();
+			return studioViewProvider.refresh();
 		}),
 		commands.registerCommand('wallpaperStudio.home', () => {
 			commands.executeCommand('setContext', 'wallpaperStudio.mode', 'menu');
@@ -197,7 +210,9 @@ export function activate(context: ExtensionContext) {
 				await setCurrentBlur(num, config);
 			}
 			// 配置对象是快照，保存后重新读取，避免共享模式应用上一次的值。
-			PickList.needAutoUpdate(getAppConfig());
+			if (!(await PickList.applyCurrentAppearance(getAppConfig()))) {
+				PickList.needAutoUpdate(getAppConfig());
+			}
 			return;
 		}
 		await config.update(key.replace(/^wallpaperStudio\./, ''), value, true);

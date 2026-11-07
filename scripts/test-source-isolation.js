@@ -11,6 +11,7 @@
  * Run after compilation: node scripts/test-source-isolation.js
  */
 'use strict';
+require('./test-env');
 
 const assert = require('assert').strict;
 const fs = require('fs');

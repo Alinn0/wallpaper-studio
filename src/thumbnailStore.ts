@@ -1,6 +1,8 @@
 import * as crypto from 'crypto';
 import * as fs from 'fs';
 import * as path from 'path';
+import * as lockfile from 'proper-lockfile';
+import { atomicWriteTextSync } from './atomicWrite';
 
 /**
  * 缩略图持久化存储（扩展侧）。
@@ -50,6 +52,7 @@ export class ThumbnailStore {
     private readonly dir: string;
     private readonly indexPath: string;
     private index: ThumbnailIndex | null = null;
+    private generation = 0;
 
     constructor(storageRoot: string) {
         this.dir = path.join(storageRoot, DIR_NAME);
@@ -104,7 +107,7 @@ export class ThumbnailStore {
         if (!this.index) { return; }
         try {
             fs.mkdirSync(this.dir, { recursive: true });
-            fs.writeFileSync(this.indexPath, JSON.stringify(this.index), 'utf8');
+            atomicWriteTextSync(this.indexPath, JSON.stringify(this.index));
         } catch (error) {
             console.warn('[WallpaperStudio] Failed to write thumbnail index:', error);
         }
@@ -134,19 +137,43 @@ export class ThumbnailStore {
     }
 
     /** 写入一张缩略图；value 是 data URL。 */
-    set(key: string, value: string): void {
-        if (!key || !value) { return; }
+    async set(key: string, value: string): Promise<void> {
+        return this.setMany([[key, value]]);
+    }
+
+    /** One lock, one eviction pass and one index write for the whole batch. */
+    async setMany(entries: Iterable<[string, string]>): Promise<void> {
+        const batch = Array.from(entries).filter(([key, value]) => key && value && value.length <= 2_000_000);
+        if (!batch.length) { return; }
+        const generation = this.generation;
+        let release: (() => Promise<void>) | undefined;
         try {
-            fs.mkdirSync(this.dir, { recursive: true });
+            await fs.promises.mkdir(this.dir, { recursive: true });
+            release = await lockfile.lock(this.indexPath, {
+                realpath: false,
+                retries: { retries: 12, minTimeout: 25, maxTimeout: 250 },
+                stale: 5000
+            });
+            if (generation !== this.generation) { return; }
+            this.index = null;
             const index = this.loadIndex();
-            const hash = this.hashOf(key);
-            const payload = value.startsWith('data:') ? value : `data:image/jpeg;base64,${value}`;
-            fs.writeFileSync(this.fileOf(hash), payload, 'utf8');
-            index[key] = { hash, usedAt: Date.now(), chars: payload.length };
+            for (const [key, value] of batch) {
+                if (generation !== this.generation) { return; }
+                const hash = this.hashOf(key);
+                const payload = value.startsWith('data:') ? value : `data:image/jpeg;base64,${value}`;
+                await fs.promises.writeFile(this.fileOf(hash), payload, 'utf8');
+                if (generation !== this.generation) {
+                    await fs.promises.unlink(this.fileOf(hash)).catch(() => undefined);
+                    return;
+                }
+                index[key] = { hash, usedAt: Date.now(), chars: payload.length };
+            }
             this.prune();
             this.saveIndex();
         } catch (error) {
             console.warn('[WallpaperStudio] Failed to store thumbnail:', error);
+        } finally {
+            if (release) { await release(); }
         }
     }
 
@@ -155,12 +182,14 @@ export class ThumbnailStore {
         const index = this.loadIndex();
         const entries = Object.entries(index).sort((a, b) => b[1].usedAt - a[1].usedAt);
         let total = 0;
+        let count = 0;
         const keep: ThumbnailIndex = {};
         for (const [key, entry] of entries) {
-            const withinCount = Object.keys(keep).length < MAX_ENTRIES;
+            const withinCount = count < MAX_ENTRIES;
             const withinSize = total + entry.chars <= MAX_TOTAL_CHARS;
             if (withinCount && withinSize) {
                 keep[key] = entry;
+                count++;
                 total += entry.chars;
             } else {
                 try { fs.rmSync(this.fileOf(entry.hash), { force: true }); } catch { /* 忽略 */ }
@@ -198,6 +227,7 @@ export class ThumbnailStore {
     }
 
     clear(): void {
+        this.generation++;
         this.index = {};
         try {
             if (!fs.existsSync(this.dir)) { return; }

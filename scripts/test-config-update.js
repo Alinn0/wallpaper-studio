@@ -1,5 +1,6 @@
 /** Run after compilation: node scripts/test-config-update.js */
 'use strict';
+require('./test-env');
 
 const assert = require('assert').strict;
 const Module = require('module');
@@ -64,6 +65,8 @@ const mockSettingsStore = {
         }
     }),
     onDidChangeSettings: settingsChanges.event,
+    onDidChangeExternalSettings: new MockEventEmitter().event,
+    startSettingsSync: () => ({ dispose() {} }),
     readSettings: () => ({ ...settings }),
     DEFAULT_SETTINGS: {}
 };
@@ -96,6 +99,15 @@ const mockVscode = {
 // Replace only UI registration and the workbench file-writing boundary.
 const originalLoad = Module._load;
 Module._load = function (request, parent) {
+    if (request === './runtimeStore') {
+        return {
+            readRuntimeState: () => ({ version: 1, workspacePaths: {},
+                workspaceImages: settings.imagePath ? { 'no-workspace': settings.imagePath } : {},
+                windowOpacity: {}, workspaceOpacity: {}, windowBlur: {}, workspaceBlur: {} }),
+            updateRuntimeState: async () => true,
+            clearLegacyImageRecords: async () => {}, pruneOrphanedWorkspaceRecords: async () => {}
+        };
+    }
     if (request === 'vscode') { return mockVscode; }
     if (request === './settingsStore') { return mockSettingsStore; }
     if (request === './FileDom') {

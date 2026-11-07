@@ -11,6 +11,7 @@
  * Run after compilation: node scripts/test-gallery-loading.js
  */
 'use strict';
+require('./test-env');
 
 const assert = require('assert').strict;
 const fs = require('fs');
@@ -73,6 +74,8 @@ const mockSettingsStore = {
         }
     }),
     onDidChangeSettings: settingsChanges.event,
+    onDidChangeExternalSettings: new MockEventEmitter().event,
+    startSettingsSync: () => ({ dispose() {} }),
     readSettings: () => ({ ...settings }),
     resetSettings: async () => {},
     DEFAULT_SETTINGS: {}
@@ -157,6 +160,16 @@ try {
     Module._load = originalLoad;
 }
 
+const engine = require('../out/wallpaperEngine');
+const originalReadPlaylist = engine.readWallpaperPlaylistAsync;
+let playlistReads = 0;
+let failNextRead = false;
+engine.readWallpaperPlaylistAsync = async (...args) => {
+    playlistReads++;
+    if (failNextRead) { failNextRead = false; throw Error('simulated playlist failure'); }
+    return originalReadPlaylist(...args);
+};
+
 PickList.startAutoRandomTask = () => {};
 PickList.autoUpdateBackground = () => {};
 PickList.applyCurrentBackground = async () => false;
@@ -214,6 +227,8 @@ function summaries() {
 function wait(ms) { return new Promise(resolve => setTimeout(resolve, ms)); }
 
 function resetFixture() {
+    playlistReads = 0;
+    failNextRead = false;
     globalState.clear();
     globalState.set('wallpaperStudioWallpaperConfig', configPath);
     globalState.set('wallpaperStudioWallpaperEnabled', true);
@@ -283,15 +298,14 @@ async function scenario(label, run) {
 }
 
 (async () => {
-    // 场景 A：启动同步已结束，用户随后切到壁纸列表页。
+    // 首页和 ready 均不读取列表，首次进入列表才扫描。
     const logA = await scenario('A 列表页按需加载', async provider => {
         provider.resolveWebviewView(makeView(), {}, { cancellationToken: {} });
-        for (let i = 0; i < 100; i += 1) {
-            await wait(50);
-            if (summaries().some(entry => entry.type === 'state' && entry.playlist > 0)) { break; }
-        }
+        await provider.handleMessage({ type: 'ready' });
+        assert.equal(playlistReads, 0, 'home/ready must not scan the gallery');
         posted.length = 0;
         await provider.handleMessage({ type: 'loadGallery' });
+        assert.equal(playlistReads, 1);
         await wait(300);
     });
 
@@ -315,6 +329,63 @@ async function scenario(label, run) {
     for (const [label, log] of [['A', logA], ['B', logB], ['C', logC]]) {
         assertNoBlankWindow(log, label);
     }
+
+    resetFixture();
+    const cached = new StudioViewProvider(context);
+    cached.resolveWebviewView(makeView(), {}, {});
+    await Promise.all(Array.from({ length: 10 }, () => cached.handleMessage({ type: 'loadGallery' })));
+    assert.equal(playlistReads, 1, 'concurrent gallery requests share one scan');
+    await wait(60);
+    posted.length = 0;
+    for (let i = 0; i < 20; i++) {
+        await cached.handleMessage({ type: 'ready' });
+        await cached.handleMessage({ type: 'loadGallery' });
+    }
+    assert.equal(playlistReads, 1, 'completed results survive repeated ready/tab entry');
+    assert.ok(!summaries().some(entry => entry.loading), 'cache hits never re-enter the loading state');
+    await cached.handleMessage({ type: 'refresh' });
+    assert.equal(playlistReads, 2, 'explicit refresh still reads from disk');
+    await wait(0);
+    await cached.handleMessage({ type: 'loadGallery' });
+    assert.equal(playlistReads, 2, 'refresh result is also reusable');
+
+    const originalConfig = fs.readFileSync(configPath, 'utf8');
+    const changed = JSON.parse(originalConfig);
+    changed[user].general.wallpaperconfig.selectedwallpapers.Monitor0.playlist.items = items.slice(0, 2);
+    fs.writeFileSync(configPath, JSON.stringify(changed), 'utf8');
+    await cached.handleMessage({ type: 'loadGallery' });
+    assert.equal(playlistReads, 3, 'config file signature invalidates completed results');
+    assert.equal(cached.wallpaperEntries.length, 2);
+    globalState.set('wallpaperStudioWallpaperRemoved', [items[0]]);
+    await cached.handleMessage({ type: 'loadGallery' });
+    assert.equal(playlistReads, 4, 'removed-list changes invalidate completed results');
+    assert.equal(cached.wallpaperEntries.find(entry => entry.path === items[0]).active, false);
+
+    changed.OtherAccount = changed[user];
+    fs.writeFileSync(configPath, JSON.stringify(changed), 'utf8');
+    globalState.set(engine.WALLPAPER_USER_KEY, 'OtherAccount');
+    await cached.handleMessage({ type: 'loadGallery' });
+    assert.equal(cached.wallpaperUser, 'OtherAccount');
+    assert.equal(playlistReads, 5, 'stored account changes invalidate completed results');
+
+    failNextRead = true;
+    await cached.handleMessage({ type: 'refresh' });
+    assert.equal(playlistReads, 6);
+    await wait(0);
+    await cached.handleMessage({ type: 'loadGallery' });
+    assert.equal(playlistReads, 7, 'failed forced refresh must not reuse an old completed key');
+    assert.equal(cached.wallpaperEntries.length, 2);
+
+    changed.OtherAccount.general.wallpaperconfig.selectedwallpapers.Monitor0.playlist.items = [];
+    fs.writeFileSync(configPath, JSON.stringify(changed), 'utf8');
+    await cached.handleMessage({ type: 'loadGallery' });
+    assert.equal(cached.wallpaperEntries.length, 0);
+    const emptyReads = playlistReads;
+    await wait(0);
+    await cached.handleMessage({ type: 'loadGallery' });
+    assert.equal(playlistReads, emptyReads, 'a valid empty playlist is also cached');
+    fs.writeFileSync(configPath, originalConfig, 'utf8');
+    console.log('PASS first-entry/concurrent/completed cache, explicit refresh, config/account/removal invalidation and failure retry');
 
     // 节流语义：连续上报时消息必须周期性发出，计数要真的推进。
     resetFixture();

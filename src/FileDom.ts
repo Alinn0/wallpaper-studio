@@ -8,6 +8,7 @@ import version from './version';
 import { SudoPromptHelper } from './SudoPromptHelper';
 import * as fse from 'fs-extra';
 import { getContext } from './global';
+import { SETTINGS_DIR } from './settingsStore';
 import { getWorkspaceCssToken, getWindowCssFileName, isPerWindowEnabled } from './windowBackground';
 import { detectPatchStateFromFile, PatchState, BOOTSTRAP_VERSION } from './patchState';
 import { expandPathVariables, hasFileExtension, isVideoFile, pickRandomFromFolder } from './pathUtil';
@@ -20,6 +21,8 @@ import {
     resolveThemeBlendRules
 } from './backgroundCss';
 import { IMAGE_FADE_JS, PRELOAD_IMAGE_JS } from './loaderFragments';
+import { SCENE_CONTINUITY_JS } from './sceneContinuity';
+import { backgroundSourceMarker, matchesBackgroundSource, patchBackgroundAppearance } from './backgroundCache';
 import {
     CUSTOM_SCENE_HTML_FILE_NAME,
     CUSTOM_SCENE_JS_FILE_NAME,
@@ -32,7 +35,7 @@ import {
     clearCodeServerWorkbenchHtmlPatch
 } from './patchCleanup';
 import { isWallpaperMpkgPath, isWallpaperPkgPath, validateWallpaperPkgFile } from './wallpaperPkg';
-import { buildWallpaperSceneHtml, copyWallpaperScenePackage, loadWallpaperSceneInputs } from './wallpaperScene';
+import { buildWallpaperScenePage, copyWallpaperScenePackage } from './wallpaperScene';
 import { getWallpaperProjectDeclaration, getWallpaperPropertyOverrides, resolveWallpaperMediaPath } from './wallpaperEngine';
 import { createSceneRenderConfig } from './sceneRender';
 import {
@@ -52,53 +55,31 @@ export {
 const SCENE_BLOCK_RE = /\/\*wallpaper-studio-scene-start\*\/([\s\S]*?)\/\*wallpaper-studio-scene-end\*\//;
 
 /**
- * 带权限处理地写文本文件：先直接写，失败则申请目录写权限后重试，最后尝试
- * 单独解锁该文件。VSCode 安装目录是受保护目录，三种情况都可能出现。
+ * 先直接写；明确的权限错误才提权复制这一个文件，不修改安装目录 ACL。
+ * 自动轮播不触发提权提示，错误交由调度器记录和重试。
  */
-async function writeTextWithPermission(filePath: string, content: string): Promise<void> {
+async function writeTextWithPermission(filePath: string, content: string, allowElevation = true): Promise<void> {
     try {
-        await fse.writeFile(filePath, content, { encoding: 'utf-8' });
-        return;
-    } catch {
-        // Install dir is protected; unlock the folder first.
-    }
-    try {
-        await ensureDirWritable(path.dirname(filePath));
         await fse.writeFile(filePath, content, { encoding: 'utf-8' });
         return;
     } catch (error) {
-        if (isElevationCancelled(error)) {
-            throw error;
-        }
-        // Existing files (workbench js) can keep a restrictive ACL after the
-        // directory grant. Unlock that one file and retry.
+        const code = (error as NodeJS.ErrnoException).code;
+        if (!allowElevation || (code !== 'EACCES' && code !== 'EPERM')) { throw error; }
     }
-    await getFilePermissionFor(filePath);
-    await fse.writeFile(filePath, content, { encoding: 'utf-8' });
-}
-
-/** 用系统工具给单个文件授权（Windows: takeown + icacls，其他平台: chmod）。 */
-async function getFilePermissionFor(filePath: string): Promise<void> {
-    const systemType = os.type();
+    // Elevate one concrete copy, preserving the installation directory ACL.
+    const temporary = path.join(os.tmpdir(), `wallpaper-studio-${crypto.randomBytes(12).toString('hex')}.tmp`);
     try {
-        const quoted = quoteShellPath(filePath);
-        const exists = await fse.pathExists(filePath);
-        if (systemType === SystemType.WINDOWS) {
-            const create = exists ? '' : `echo. > ${quoted} & `;
-            await SudoPromptHelper.exec(
-                `${create}takeown /f ${quoted} /a & icacls ${quoted} /grant Users:F`
-            );
-            return;
-        }
-        const chmodCmd = systemType === SystemType.MACOS ? 'chmod a+rwx' : 'chmod 666';
-        if (exists) {
-            await SudoPromptHelper.exec(`${chmodCmd} ${quoted}`);
+        await fs.promises.writeFile(temporary, content, { encoding: 'utf8', mode: 0o644, flag: 'wx' });
+        if (os.type() === SystemType.WINDOWS) {
+            const literal = (value: string) => `'${value.replace(/'/g, "''")}'`;
+            const script = `Copy-Item -LiteralPath ${literal(temporary)} -Destination ${literal(filePath)} -Force -ErrorAction Stop`;
+            const encoded = Buffer.from(script, 'utf16le').toString('base64');
+            await SudoPromptHelper.exec(`powershell.exe -NoProfile -NonInteractive -EncodedCommand ${encoded}`);
         } else {
-            await SudoPromptHelper.exec(`touch ${quoted} && ${chmodCmd} ${quoted}`);
+            await SudoPromptHelper.exec(`cp -f ${quoteShellPath(temporary)} ${quoteShellPath(filePath)}`);
         }
-    } catch (error) {
-        console.error(`Failed to get permission for ${filePath}:`, error);
-        throw error;
+    } finally {
+        try { await fs.promises.unlink(temporary); } catch { /* Already removed or unavailable. */ }
     }
 }
 
@@ -108,6 +89,31 @@ export function getActiveWindowCssFile(): { filePath: string; token: string } {
     return perWindow
         ? { filePath: path.join(selectedWorkbench.root, getWindowCssFileName()), token: getWorkspaceCssToken() }
         : { filePath: CUSTOM_CSS_FILE_PATH, token: SHARED_CSS_TOKEN };
+}
+
+export async function hasCachedBackgroundCss(imagePath: string): Promise<boolean> {
+    try { return matchesBackgroundSource(await fse.readFile(getActiveWindowCssFile().filePath, 'utf8'), imagePath); }
+    catch { return false; }
+}
+
+export async function patchBackgroundAppearanceInCss(
+    imagePath: string, opacity: number, blur: number, shouldApply: () => boolean
+): Promise<boolean> {
+    const lockPath = path.join(os.tmpdir(), 'vscode-background.lock');
+    const target = getActiveWindowCssFile().filePath;
+    if (!(await fse.pathExists(lockPath))) { return false; }
+    const release = await lockfile.lock(lockPath, { retries: { retries: 5, minTimeout: 25, maxTimeout: 100 }, stale: 20000 })
+        .catch(() => undefined);
+    if (!release) { return false; }
+    try {
+        if (!shouldApply()) { return false; }
+        const css = await fse.readFile(target, 'utf8');
+        const next = patchBackgroundAppearance(css, imagePath, opacity, blur);
+        if (next === undefined || !shouldApply()) { return false; }
+        if (next !== css) { await writeTextWithPermission(target, next); }
+        return true;
+    } catch { return false; }
+    finally { await release(); }
 }
 
 /**
@@ -312,6 +318,7 @@ const DESKTOP_HTML_ENTRIES = [
 // workbench bundle 读进来做正则比对；文件被 VS Code 更新或被别处改写时 mtime/size 会变，
 // 自然落回完整校验。
 const verifiedBundles = new Map<string, { hash: string; mtimeMs: number; size: number }>();
+const verifiedGeneratedFiles = new Map<string, { content: string; mtimeMs: number; size: number }>();
 
 async function statSignature(filePath: string): Promise<{ mtimeMs: number; size: number } | undefined> {
     try {
@@ -350,11 +357,6 @@ enum SystemType {
     LINUX = 'Linux'
 }
 
-// One elevated grant per directory per process. New per-window CSS files keep
-// appearing under workbench/, so unlocking the folder once avoids a UAC prompt
-// on every new window.
-const dirUnlockInFlight = new Map<string, Promise<void>>();
-
 function quoteWinPath(filePath: string): string {
     return `"${filePath}"`;
 }
@@ -366,45 +368,6 @@ function quotePosixPath(filePath: string): string {
 
 function quoteShellPath(filePath: string): string {
     return os.type() === SystemType.WINDOWS ? quoteWinPath(filePath) : quotePosixPath(filePath);
-}
-
-async function unlockDir(dirPath: string): Promise<void> {
-    window.setStatusBarMessage(
-        '正在开放背景文件目录写入权限，请在弹出的授权窗口中确认一次。 / Granting write access to the background folder. Please confirm the permission prompt once.',
-        15000
-    );
-    const systemType = os.type();
-    if (systemType === SystemType.WINDOWS) {
-        const quoted = quoteWinPath(dirPath);
-        // (OI)(CI) = new files and subfolders inherit Users:F, so later windows
-        // can create css-wallpaper-studio.<session>.css without another prompt.
-        await SudoPromptHelper.exec(
-            `takeown /f ${quoted} /a & icacls ${quoted} /grant "Users:(OI)(CI)F"`
-        );
-        return;
-    }
-    if (systemType === SystemType.MACOS || systemType === SystemType.LINUX) {
-        await SudoPromptHelper.exec(`chmod a+rwx ${quotePosixPath(dirPath)}`);
-    }
-}
-
-async function ensureDirWritable(dirPath: string): Promise<void> {
-    const normalized = path.normalize(dirPath);
-    const existing = dirUnlockInFlight.get(normalized);
-    if (existing) {
-        await existing;
-        return;
-    }
-    const task = unlockDir(normalized).catch((error) => {
-        dirUnlockInFlight.delete(normalized);
-        throw error;
-    });
-    dirUnlockInFlight.set(normalized, task);
-    await task;
-}
-
-function isElevationCancelled(error: unknown): boolean {
-    return /did not grant permission|canceled|cancelled/i.test(String(error));
 }
 
 export async function removeWallpaperStudioCssFiles(): Promise<void> {
@@ -420,25 +383,13 @@ export async function removeWallpaperStudioCssFiles(): Promise<void> {
     }
     const cssFiles = names.filter(name => name.startsWith('css-wallpaper-studio') && name.endsWith('.css'));
     const systemType = os.type();
-    let dirUnlocked = false;
     for (const name of cssFiles) {
         const filePath = path.join(WORKBENCH_DIR, name);
         try {
             await fse.remove(filePath);
             continue;
         } catch {
-            if (!dirUnlocked) {
-                try {
-                    await ensureDirWritable(WORKBENCH_DIR);
-                    dirUnlocked = true;
-                    await fse.remove(filePath);
-                    continue;
-                } catch (error) {
-                    if (isElevationCancelled(error)) {
-                        throw error;
-                    }
-                }
-            }
+            // Elevate only deletion of this generated file; preserve directory ACLs.
         }
         try {
             if (systemType === SystemType.WINDOWS) {
@@ -505,6 +456,8 @@ export class FileDom {
     private readonly filePath: string;
     private readonly extName = "wallpaperStudio";
     private imagePath: string;
+    private mediaSourcePath: string;
+    private readonly sourceImagePath: string;
     private readonly imageOpacity: number;
     private readonly sizeModel: string;
     private readonly blur: number;
@@ -541,6 +494,8 @@ export class FileDom {
         this.workConfig = workConfig;
         this.filePath = JS_FILE_PATH;
         this.imagePath = imagePath;
+        this.sourceImagePath = imagePath;
+        this.mediaSourcePath = imagePath;
         this.imageOpacity = Math.min(opacity, 0.8);
         this.sizeModel = sizeModel || "cover";
         this.blur = blur;
@@ -619,6 +574,7 @@ export class FileDom {
             }
         }
 
+        this.mediaSourcePath = this.imagePath;
         let lowerPath = this.imagePath.toLowerCase();
         if (isWallpaperMpkgPath(this.imagePath)) {
             throw new Error('Wallpaper Engine .mpkg（PKGM）暂不支持，请改用 .pkg 场景包。');
@@ -1028,11 +984,6 @@ export class FileDom {
         }
     }
 
-    // 获取单个文件权限（目录授权仍盖不住的已有受保护文件才走这里）
-    public async getFilePermission(filePath: string): Promise<void> {
-        await getFilePermissionFor(filePath);
-    }
-
     // 清理补丁内容
     public async uninstall(): Promise<boolean> {
         try {
@@ -1185,7 +1136,7 @@ export class FileDom {
 
     // 写入文件内容，带权限处理
     private async writeWithPermission(filePath: string, content: string): Promise<void> {
-        await writeTextWithPermission(filePath, content);
+        await writeTextWithPermission(filePath, content, !this.silent);
     }
 
     // 写入备份文件
@@ -1229,23 +1180,11 @@ export class FileDom {
     }
 
     private async saveDynamicJsContent(): Promise<boolean> {
-        const js = this.getDynamicJs();
-        try {
-            if (await fse.pathExists(CUSTOM_JS_FILE_PATH)) {
-                const current = await fse.readFile(CUSTOM_JS_FILE_PATH, 'utf-8');
-                if (current === js) {
-                    return false;
-                }
-            }
-        } catch {
-            // Fall through to write; permission handling below will surface real failures.
-        }
-        await this.writeWithPermission(CUSTOM_JS_FILE_PATH, js);
-        return true;
+        return this.writeGeneratedTextFile(CUSTOM_JS_FILE_PATH, this.getDynamicJs());
     }
 
     private async saveWallpaperSceneRuntimeContent(): Promise<void> {
-        const inputs = await loadWallpaperSceneInputs(getContext().extensionPath);
+        const { html } = await buildWallpaperScenePage(getContext().extensionPath);
         if (!this.wallpaperPkgSourcePath) {
             throw new Error('Wallpaper Engine scene package source path is unavailable.');
         }
@@ -1253,18 +1192,28 @@ export class FileDom {
             this.wallpaperSceneUrl = this.imagePath;
         } else {
             await validateWallpaperPkgFile(this.wallpaperPkgSourcePath);
-            const packageAssetPath = await copyWallpaperScenePackage(this.wallpaperPkgSourcePath, CUSTOM_ASSET_DIR);
+            // vscode-file only serves arbitrary file types from registered roots.
+            // A .pkg under the home directory is refused even though it exists.
+            // Keep readable bytes inside appRoot and only hash metadata in user storage.
+            const packageAssetPath = await copyWallpaperScenePackage(
+                this.wallpaperPkgSourcePath, CUSTOM_ASSET_DIR, path.join(SETTINGS_DIR, 'scene-assets', '.sources')
+            );
             this.wallpaperSceneUrl = Uri.file(packageAssetPath)
                 .with({ scheme: 'vscode-file', authority: 'vscode-app' })
                 .toString();
         }
         await this.writeGeneratedTextFile(
             CUSTOM_SCENE_HTML_FILE_PATH,
-            buildWallpaperSceneHtml(inputs.template, inputs.runtime, inputs.sceneScript)
+            html
         );
     }
 
-    private async writeGeneratedTextFile(filePath: string, content: string): Promise<void> {
+    private async writeGeneratedTextFile(filePath: string, content: string): Promise<boolean> {
+        const expected = verifiedGeneratedFiles.get(filePath);
+        if (expected && expected.content === content) {
+            const current = await statSignature(filePath);
+            if (current?.mtimeMs === expected.mtimeMs && current?.size === expected.size) { return false; }
+        }
         let current: string | undefined;
         try {
             current = await fs.promises.readFile(filePath, 'utf8');
@@ -1274,6 +1223,9 @@ export class FileDom {
         if (current !== content) {
             await this.writeWithPermission(filePath, content);
         }
+        const signature = await statSignature(filePath);
+        if (signature) { verifiedGeneratedFiles.set(filePath, { content, ...signature }); }
+        return current !== content;
     }
 
     // code-server 静态资源会被浏览器长缓存，给 workbench.js URL 增加版本参数以确保首次注入后能加载新文件。
@@ -1501,6 +1453,10 @@ export class FileDom {
     }
     // 获取css内容
     private getCss(): string {
+        return backgroundSourceMarker(this.sourceImagePath || this.mediaSourcePath || this.imagePath) + this.getMediaCss();
+    }
+
+    private getMediaCss(): string {
         const opacity = Math.min(this.imageOpacity, 0.8);
         const { sizeModelVal, repeatVal, positionVal } = this.getCssStyles();
         let backgroundPosition = positionVal;
@@ -1543,6 +1499,8 @@ export class FileDom {
         if (this.isVideo) {
             const config = {
                 url: rawPath,
+                position: this.getViewPosition(positionVal),
+                fit: this.sizeModel === 'contain' ? 'contain' : 'cover',
                 opacity: opacity,
                 blur: this.blur,
                 // A4: auto 模式注入 CSS 变量，主题切换由 :has() 即时适配
@@ -1564,17 +1522,7 @@ export class FileDom {
             `;
         }
 
-        const viewOverrides = getWallpaperPropertyOverrides(
-            getContext().globalState,
-            this.imagePath
-        );
-        const panX = Number(viewOverrides.wallpaperstudio_pan_x);
-        const panY = Number(viewOverrides.wallpaperstudio_pan_y);
-        if (Number.isFinite(panX) || Number.isFinite(panY)) {
-            const x = Number.isFinite(panX) ? Math.max(0, Math.min(200, panX)) : 100;
-            const y = Number.isFinite(panY) ? Math.max(0, Math.min(200, panY)) : 100;
-            backgroundPosition = `${x / 2}% ${y / 2}%`;
-        }
+        backgroundPosition = this.getViewPosition(positionVal);
 
         return `
         body::before{
@@ -1658,6 +1606,8 @@ export class FileDom {
                     if (!video.loop) video.loop = true;
                     if (!video.muted) video.muted = true;
 
+                    video.style.objectPosition = config.position || 'center';
+                    video.style.objectFit = config.fit || 'cover';
                     video.style.opacity = config.opacity + '';
                     video.style.filter = 'blur(' + config.blur + 'px)';
                     video.style.mixBlendMode = config.blendMode;
@@ -2029,6 +1979,7 @@ export class FileDom {
             }
             
             ${videoSetup}
+            ${SCENE_CONTINUITY_JS}
 
             /**
              * 场景页地址。
@@ -2041,6 +1992,7 @@ export class FileDom {
             const sceneRendererUrl = (() => {
                 const url = new URL('./wallpaper-studio-scene.html', import.meta.url);
                 url.searchParams.set('resources', 'native');
+                url.searchParams.set('runtime', 'continuity-20261107');
                 return url.toString();
             })();
 
@@ -2048,6 +2000,7 @@ export class FileDom {
                 const state = targetWindow && targetWindow.__wallpaperStudioSceneState;
                 if (!state) return;
                 state.generation++;
+                if (state.fetchController) { state.fetchController.abort(); state.fetchController = null; }
                 if (state.frame && state.frame.contentWindow) {
                     try {
                         state.frame.contentWindow.postMessage({ type: 'dispose', token: state.token }, '*');
@@ -2060,6 +2013,7 @@ export class FileDom {
                 state.url = '';
                 state.config = null;
                 if (removeFrame) {
+                    clearWallpaperPoster(targetWindow);
                     detachScenePointer(targetWindow, state);
                     if (state.messageHandler) {
                         targetWindow.removeEventListener('message', state.messageHandler);
@@ -2161,13 +2115,18 @@ export class FileDom {
                 state.loading = true;
                 const generation = state.generation;
                 const token = state.token;
+                const startedAt = performance.now();
+                const controller = new AbortController();
+                state.fetchController = controller;
                 // Allow Electron to reuse the local package cache across
                 // workbench reloads instead of rereading the entire .pkg.
-                targetWindow.fetch(state.config.url).then(function(response) {
+                targetWindow.fetch(state.config.url, { signal: controller.signal }).then(function(response) {
                     if (!response.ok) throw new Error('Scene package fetch failed: ' + response.status);
                     return response.arrayBuffer();
                 }).then(function(buffer) {
                     if (targetWindow.__wallpaperStudioSceneState !== state || state.generation !== generation) return;
+                    recordWallpaperTiming(targetWindow, 'package-fetch', performance.now() - startedAt);
+                    state.sentIdentity = wallpaperSceneIdentity(state.config);
                     // postMessage 走结构化克隆：这里的内容虽然来自 JSON.parse，
                     // 但仍做一次深拷贝，彻底排除被其他代码塞进的不可克隆值。
                     var project = state.config.project;
@@ -2246,6 +2205,13 @@ export class FileDom {
                             if (message.type === 'scene-ready') {
                                 state.loading = false;
                                 state.ready = true;
+                                clearWallpaperPoster(targetWindow);
+                                if (state.sentIdentity === wallpaperSceneIdentity(state.config)) {
+                                    saveWallpaperPoster(targetWindow, activeCssUrl(), state.config, message.poster);
+                                }
+                                recordWallpaperTiming(targetWindow, 'scene-mount', Number(message.mountMs) || 0);
+                                recordWallpaperTiming(targetWindow, 'renderer-switch-ready', performance.now() - state.requestedAt);
+                                frame.contentWindow.postMessage({ type: 'set-properties', properties: state.config.properties || {} }, '*');
                             } else if (message.type === 'scene-error') {
                                 state.loading = false;
                                 state.ready = false;
@@ -2257,6 +2223,7 @@ export class FileDom {
                         attachScenePointer(targetWindow, state);
                         frame.src = sceneRendererUrl;
                         doc.body.prepend(frame);
+                        showWallpaperPoster(targetWindow, activeCssUrl(), config);
                     }
 
                     state.frame.title = config.title || 'Wallpaper Engine scene';
@@ -2275,7 +2242,13 @@ export class FileDom {
                         return;
                     }
 
-                    disposeScene(targetWindow, false);
+                    // Keep the current scene until new bytes arrive.
+                    // The isolated renderer covers its old frame before replacing the single GPU scene.
+                    if (state.fetchController) { state.fetchController.abort(); }
+                    state.generation++;
+                    state.loading = false;
+                    state.ready = false;
+                    state.requestedAt = performance.now();
                     state.url = config.url;
                     state.config = config;
                     state.token = Date.now().toString(36) + '-' + Math.random().toString(36).slice(2);
@@ -2589,6 +2562,15 @@ export class FileDom {
 
         })();
         `;
+    }
+
+    private getViewPosition(fallback: string): string {
+        const overrides = getWallpaperPropertyOverrides(getContext().globalState, this.mediaSourcePath);
+        const x = Number(overrides.wallpaperstudio_pan_x);
+        const y = Number(overrides.wallpaperstudio_pan_y);
+        if (!Number.isFinite(x) && !Number.isFinite(y)) { return fallback; }
+        const axis = (value: number) => Number.isFinite(value) ? Math.max(0, Math.min(200, value)) / 2 : 50;
+        return `${axis(x)}% ${axis(y)}%`;
     }
 
     // 获取css样式值

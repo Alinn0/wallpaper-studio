@@ -1,6 +1,8 @@
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
+import { VIDEO_EXTS } from './mediaTypes';
+import { normalizeComparablePath } from './pathComparison';
 
 export const DEFAULT_WALLPAPER_CONFIG =
     'E:\\Games\\Steam\\steamapps\\common\\wallpaper_engine\\config.json';
@@ -33,7 +35,7 @@ export interface WallpaperProperty {
 }
 
 function normalize(value: string): string {
-    return path.normalize(value).replace(/\//g, '\\').toLowerCase();
+    return normalizeComparablePath(value);
 }
 
 function readJson(filePath: string): any {
@@ -210,7 +212,7 @@ interface ProjectInfo {
 /** 支持在扩展里渲染的壁纸种类。其余（web / application / 未知）在导入时会被排除。 */
 export type WallpaperKind = 'scene' | 'video' | 'web' | 'application' | 'other';
 
-const VIDEO_EXTENSIONS = ['.mp4', '.webm', '.ogg', '.mov', '.m4v', '.avi', '.mkv'];
+const VIDEO_EXTENSIONS = VIDEO_EXTS;
 
 /**
  * 判定一张壁纸属于哪种类型。

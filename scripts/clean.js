@@ -13,9 +13,10 @@
 const fs = require('fs');
 const path = require('path');
 
-const ROOT = path.join(__dirname, '..');
+const ROOT = path.resolve(__dirname, '..');
 for (const name of ['out', 'webview-dist']) {
-    const target = path.join(ROOT, name);
+    const target = path.resolve(ROOT, name);
+    if (path.dirname(target) !== ROOT) { throw new Error('Build directory escaped the project root'); }
     fs.rmSync(target, { recursive: true, force: true });
     console.log(`cleaned ${name}`);
 }

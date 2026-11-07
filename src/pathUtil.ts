@@ -9,12 +9,10 @@
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
+import { MEDIA_EXTS } from './mediaTypes';
+export { MEDIA_EXTS, VIDEO_EXTS, isVideoFile } from './mediaTypes';
 
 /** 与图库选择和 FileDom 媒体识别保持一致的支持类型。 */
-export const MEDIA_EXTS = [
-    '.svg', '.png', '.jpg', '.jpeg', '.gif', '.bmp', '.webp', '.jfif',
-    '.mp4', '.webm', '.ogg', '.mov', '.pkg'
-];
 
 /**
  * 展开路径中的 `~`（用户目录）和环境变量（`${ENV}`、`$ENV`）。
@@ -44,16 +42,9 @@ export function hasFileExtension(p: string): boolean {
     return /\.[^\\/]+$/.test(p);
 }
 
-export const VIDEO_EXTS = ['.mp4', '.webm', '.ogg', '.mov'];
-
 export function isSupportedMedia(name: string): boolean {
     const lower = name.toLowerCase();
     return MEDIA_EXTS.some((ext) => lower.endsWith(ext));
-}
-
-export function isVideoFile(name: string): boolean {
-    const lower = name.toLowerCase().split(/[?#]/)[0];
-    return VIDEO_EXTS.some((ext) => lower.endsWith(ext));
 }
 
 export function delay(ms: number): Promise<void> {

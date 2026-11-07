@@ -13,6 +13,7 @@
  * - 注入产物冒烟：编译后的 FileDom.js 包含预加载片段与 CSS 变量。
  */
 'use strict';
+require('./test-env');
 
 const fs = require('fs');
 const os = require('os');

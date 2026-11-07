@@ -44,8 +44,9 @@
                 </div>
                 <el-empty v-else :description="emptyDescription" :image-size="50" />
             </div>
-            <div ref="listElement" class="wallpaper-list">
-                <div v-for="wallpaper in displayWallpapers" :key="wallpaper.path" class="wallpaper-row" :class="{ 'is-current': wallpaper.path === config.imagePath }" :data-pkg="sceneKey(wallpaper)" :ref="registerThumb" @click="onSelectWallpaper(wallpaper)" @mouseenter="onPkgHover(sceneKey(wallpaper))" @contextmenu.prevent="onRowContextMenu($event, wallpaper.path)">
+            <div ref="listElement" class="wallpaper-list" @scroll="onListScroll">
+                <div :style="{ height: Math.max(0, displayWallpapers.length * ROW_HEIGHT - 6) + 'px', position: 'relative', flexShrink: 0 }">
+                <div v-for="(wallpaper, index) in visibleWallpapers" :key="wallpaper.path" class="wallpaper-row" :style="{ position: 'absolute', top: (windowStart + index) * ROW_HEIGHT + 'px', left: 0, right: 0 }" :class="{ 'is-current': wallpaper.path === config.imagePath }" :data-pkg="sceneKey(wallpaper)" :ref="registerThumb" @click="onSelectWallpaper(wallpaper)" @mouseenter="onPkgHover(sceneKey(wallpaper))" @contextmenu.prevent="onRowContextMenu($event, wallpaper.path)">
                     <video
                         v-if="(wallpaper.mediaSource || wallpaper.preview) && isVideoPath(wallpaper.path) && !mediaFrames[wallpaper.path]"
                         :src="wallpaper.mediaSource || wallpaper.preview"
@@ -74,6 +75,7 @@
                     </div>
                     <el-button size="small" text type="danger" :title="t('removeFromPlaylist')" @click.stop="onRemoveWallpaper(wallpaper.path)"><el-icon><Delete /></el-icon></el-button>
                 </div>
+                </div>
             </div>
         </el-card>
 
@@ -95,7 +97,7 @@
 </template>
 
 <script setup lang="ts">
-import { computed, nextTick, onMounted, onUnmounted, onUpdated, reactive, ref } from 'vue';
+import { computed, nextTick, onMounted, onUnmounted, onUpdated, reactive, ref, watch } from 'vue';
 import { Plus, FolderAdd, FolderOpened, Picture, VideoCamera, Delete, Loading, WarningFilled, RefreshRight, Refresh, Top } from '@element-plus/icons-vue';
 import { useI18n } from '../composables/useI18n';
 import { useBridge } from '../composables/useBridge';
@@ -110,6 +112,10 @@ const bridge = useBridge();
 const scenePreview = useScenePreview();
 const wallpaperSearch = ref('');
 const listElement = ref<HTMLElement>();
+const ROW_HEIGHT = 60;
+const scrollTop = ref(0);
+const viewportHeight = ref(480);
+let resizeObserver: ResizeObserver | undefined;
 
 /** 三种来源归一成同一种行结构：标题取项目名（Wallpaper 配置）或文件名（其余两种）。 */
 interface GalleryItem {
@@ -186,6 +192,21 @@ const displayWallpapers = computed<GalleryItem[]>(() => {
 function sceneKey(wallpaper: { path: string; sceneSource?: string }): string {
     return isWallpaperPkgPath(wallpaper.path) ? (wallpaper.sceneSource || '') : '';
 }
+
+const windowStart = computed(() => Math.max(0, Math.floor(scrollTop.value / ROW_HEIGHT) - 4));
+const visibleWallpapers = computed(() => displayWallpapers.value.slice(windowStart.value,
+    windowStart.value + Math.ceil(viewportHeight.value / ROW_HEIGHT) + 8));
+function onListScroll(event: Event) {
+    scrollTop.value = (event.currentTarget as HTMLElement).scrollTop;
+    closeContextMenu();
+}
+watch(displayWallpapers, () => {
+    const maximum = Math.max(0, displayWallpapers.value.length * ROW_HEIGHT - viewportHeight.value);
+    if (scrollTop.value > maximum) {
+        scrollTop.value = maximum;
+        if (listElement.value) { listElement.value.scrollTop = maximum; }
+    }
+});
 
 /** pkg 的 webview URI → 已渲染的首帧 dataURL（只增不减，最多几十帧 JPEG）。 */
 const pkgFrames = reactive<Record<string, string>>({});
@@ -271,7 +292,7 @@ function captureVideoFrame(event: Event, key: string) {
 
 /** 首帧缓存优先：命中就直接用，不再加载视频文件。 */
 function hydrateVideoThumbnails() {
-    displayWallpapers.value.forEach(item => {
+    visibleWallpapers.value.forEach(item => {
         if (mediaFrames[item.path]) { return; }
         if (isVideoPath(item.path)) {
             const cached = getThumbnail(`video:${item.path}`);
@@ -349,13 +370,14 @@ function scrollToTop() {
 }
 
 let videoObserver: IntersectionObserver | null = null;
-const observedVideos = new WeakSet<Element>();
+let observedVideos = new WeakSet<Element>();
 /** 视频缩略图：默认 preload=none，只有进入视口（或就是当前壁纸）才开始加载。 */
 function registerVideoThumb(el: any) {
     const node = el as HTMLVideoElement | null;
-    if (!node || !node.dataset.video || observedVideos.has(node)) { return; }
+    if (!node || !node.getClientRects().length || !node.dataset.video || node.dataset.thumbRequested || observedVideos.has(node)) { return; }
     observedVideos.add(node);
     if (node.closest('.is-current')) {
+        node.dataset.thumbRequested = 'true';
         node.preload = 'auto';
         node.load();
         return;
@@ -366,6 +388,7 @@ function registerVideoThumb(el: any) {
                 if (!entry.isIntersecting) { return; }
                 const video = entry.target as HTMLVideoElement;
                 videoObserver?.unobserve(video);
+                video.dataset.thumbRequested = 'true';
                 video.preload = 'auto';
                 video.load();
             });
@@ -385,13 +408,14 @@ function onPkgHover(display: string | undefined, priority = false) {
         if (url) {
             pkgFrames[display] = url;
         } else {
-            pkgErrors[display] = scenePreview.lastError(display) || t('scenePreviewFailed');
+            const error = scenePreview.lastError(display);
+            if (error) { pkgErrors[display] = error; }
         }
     });
 }
 
 let observer: IntersectionObserver | null = null;
-const observed = new WeakSet<Element>();
+let observed = new WeakSet<Element>();
 
 function ensureObserver(): IntersectionObserver {
     if (observer) { return observer; }
@@ -410,7 +434,7 @@ function ensureObserver(): IntersectionObserver {
 /** 模板 ref：只有带 data-pkg 的缩略图（即场景包）需要提前渲染。 */
 function registerThumb(el: any) {
     const node = el as HTMLElement | null;
-    if (!node || !node.dataset || !node.dataset.pkg) { return; }
+    if (!node || !node.getClientRects().length || !node.dataset || !node.dataset.pkg) { return; }
     if (pkgFrames[node.dataset.pkg] || pkgErrors[node.dataset.pkg]) { return; }
     if (node.closest('.is-current')) {
         onPkgHover(node.dataset.pkg, true);
@@ -435,7 +459,32 @@ function scanThumbs() {
     });
 }
 
+watch(visibleWallpapers, () => {
+    scenePreview.cancelQueuedExcept(new Set(visibleWallpapers.value.map(sceneKey).filter(Boolean)));
+    observer?.disconnect();
+    videoObserver?.disconnect();
+    observed = new WeakSet();
+    observedVideos = new WeakSet();
+    void nextTick(() => {
+        scanThumbs();
+        listElement.value?.querySelectorAll<HTMLVideoElement>('video[data-video]').forEach(registerVideoThumb);
+    });
+});
+
+function onGalleryVisibility() {
+    if (!document.hidden) {
+        scanThumbs();
+        listElement.value?.querySelectorAll<HTMLVideoElement>('video[data-video]').forEach(registerVideoThumb);
+    }
+}
+
 onMounted(() => {
+    document.addEventListener('visibilitychange', onGalleryVisibility);
+    if (listElement.value && typeof ResizeObserver !== 'undefined') {
+        resizeObserver = new ResizeObserver(() => { viewportHeight.value = listElement.value?.clientHeight || 480; });
+        resizeObserver.observe(listElement.value);
+        viewportHeight.value = listElement.value.clientHeight || 480;
+    }
     void nextTick(() => {
         hydrateVideoThumbnails();
         scanThumbs();
@@ -452,6 +501,9 @@ onUpdated(() => {
 });
 
 onUnmounted(() => {
+    document.removeEventListener('visibilitychange', onGalleryVisibility);
+    resizeObserver?.disconnect();
+    scenePreview.cancelQueuedExcept(new Set());
     observer?.disconnect();
     observer = null;
     videoObserver?.disconnect();
@@ -528,7 +580,7 @@ onUnmounted(() => {
     cursor: pointer;
     &:hover { background: var(--vscode-menu-selectionBackground, rgba(56, 189, 248, 0.28)); }
 }
-.wallpaper-row { display: flex; align-items: center; gap: 8px; padding: 6px; border-radius: 6px; background: var(--studio-input-bg); cursor: default; border: 1px solid transparent; }
+.wallpaper-row { display: flex; align-items: center; height: 54px; box-sizing: border-box; gap: 8px; padding: 6px; border-radius: 6px; background: var(--studio-input-bg); cursor: default; border: 1px solid transparent; }
 .wallpaper-row:hover { border-color: #3b82f6; box-shadow: 0 0 0 1px rgba(59, 130, 246, 0.35); }
 .wallpaper-row.is-current { outline: 1px solid var(--studio-accent); }
 .wallpaper-preview { width: 72px; height: 40px; object-fit: cover; border-radius: 4px; background: #000; flex: 0 0 auto; }
