@@ -49,7 +49,14 @@
     let token = '';
     let generation = 0;
     let scene;
-    let refreshRatePromise;
+    let targetFps = 60;
+    let displayFps = 60;
+    let capturing = false;
+    function applyTargetFps(value, maximum) {
+        if (Number.isFinite(maximum) && maximum >= 15) { displayFps = Math.round(maximum); }
+        if (Number.isFinite(value)) { targetFps = Math.max(15, Math.round(value)); }
+        if (scene) { scene.setFps(capturing ? 24 : Math.min(targetFps, displayFps)); }
+    }
     /** 场景挂载前收到的最后一次指针，挂载后补发。 */
     let lastPointer;
     /** 最近一次生效的属性：setFit 会把 coverAlign 重置成居中，需要重新补上视角。 */
@@ -203,6 +210,7 @@
             announceReady();
             return;
         }
+        if (message.type === 'set-properties') { applyTargetFps(message.targetFps, message.maxFps); }
         if (message.type === 'set-properties' && scene && message.properties) {
             scene.setProperties(message.properties);
             applyViewOffset(message.properties);
@@ -234,56 +242,11 @@
         });
     });
 
-    /**
-     * 用 requestAnimationFrame 采样显示器实际刷新率，作为场景渲染的帧率上限，
-     * 让动画尽量跑满屏幕刷新率（包括 60/120/144/165/240 Hz 及更高刷新率）。
-     * 采样不足时使用 60；背景上限 120，缩略图固定 24，减少同时初始化的 GPU 压力。
-     */
-    function detectRefreshRate() {
-        if (refreshRatePromise) { return refreshRatePromise; }
-        refreshRatePromise = new Promise(function(resolve) {
-            // rAF 已被换成定时器（宿主不可见），采样没有意义，直接跟随 rAF 逐帧渲染。
-            if (globalThis.__wallpaperStudioFrameClockPatched) {
-                // ensureFrameClock 的定时器是 30Hz，不能伪报成更高刷新率。
-                resolve(30);
-                return;
-            }
-            const samples = [];
-            let last = 0;
-            let settled = false;
-            let timer = 0;
-            function finish(fps) {
-                if (settled) { return; }
-                settled = true;
-                window.clearTimeout(timer);
-                resolve(fps);
-            }
-            function medianFps(deltas) {
-                const sorted = deltas.slice().sort(function(a, b) { return a - b; });
-                const median = sorted[Math.floor(sorted.length / 2)] || 16.7;
-                return Math.max(24, Math.min(360, Math.round(1000 / median)));
-            }
-            timer = window.setTimeout(function() {
-                finish(samples.length >= 3 ? medianFps(samples) : 60);
-            }, 600);
-            function tick(time) {
-                if (settled) { return; }
-                if (last) { samples.push(time - last); }
-                last = time;
-                if (samples.length >= 12) {
-                    // 丢掉前几帧：首次渲染与页面加载的抖动会明显偏高。
-                    finish(medianFps(samples.slice(3)));
-                    return;
-                }
-                window.requestAnimationFrame(tick);
-            }
-            window.requestAnimationFrame(tick);
-        });
-        return refreshRatePromise;
-    }
-
     async function loadScene(message, currentGeneration) {
         const startedAt = performance.now();
+        capturing = !!message.capture;
+        targetFps = Number.isFinite(message.targetFps) ? Math.max(15, Math.round(message.targetFps)) : 60;
+        displayFps = Number.isFinite(message.maxFps) && message.maxFps >= 15 ? Math.round(message.maxFps) : 60;
         if (!message.capture) {
             let snapshot = lastPoster;
             try { snapshot = capturePoster() || snapshot; } catch (e) { /* Preserve the previous cached frame. */ }
@@ -299,9 +262,8 @@
             if (!api || typeof api.mount !== 'function' || typeof api.bytesSource !== 'function') {
                 throw new Error('WebWallGL renderer failed to initialize.');
             }
-            // Mount immediately at 60 FPS without waiting for monitor sampling.
+            // Reuse the shared measured limit. Only the explicit panel action samples the display.
             // Thumbnail work is capped at 24 FPS and never runs a second live scene.
-            const refreshRatePromise = message.capture ? Promise.resolve(24) : detectRefreshRate();
             const instance = await api.mount(host, {
                 source: api.bytesSource(
                     new Uint8Array(message.bytes),
@@ -312,7 +274,7 @@
                     'wallpaper-studio:' + message.key
                 ),
                 fit: 'cover',
-                fps: message.capture ? 24 : 60,
+                fps: message.capture ? 24 : Math.min(targetFps, displayFps),
                 mountTimeoutMs: 30000,
                 volume: 0,
                 scripts: true,
@@ -328,11 +290,6 @@
             currentProperties = message.properties || {};
             applyViewOffset();
             installFitGuard(instance);
-            void refreshRatePromise.then(function(fps) {
-                if (currentGeneration === generation && token === message.token && scene === instance) {
-                    try { instance.setFps(message.capture ? 24 : Math.min(120, fps)); } catch (e) { /* renderer may be closing */ }
-                }
-            });
             // 补发挂载前收到的指针，首帧就能带正确的视差/鼠标跟随角度。
             if (lastPointer && !lastPointer.leave) {
                 try { instance.pushPointer(lastPointer.u, lastPointer.v, lastPointer.buttons, lastPointer.mods); } catch (e) { /* 忽略 */ }

@@ -101,7 +101,10 @@ const originalLoad = Module._load;
 Module._load = function (request, parent) {
     if (request === './runtimeStore') {
         return {
+            onDidChangeRuntime: () => disposable(), startRuntimeSync: () => disposable(),
             readRuntimeState: () => ({ version: 1, workspacePaths: {},
+                workspaceStagedImages: {},
+                workspacePinnedImages: {}, workspacePreviousImages: {},
                 workspaceImages: settings.imagePath ? { 'no-workspace': settings.imagePath } : {},
                 windowOpacity: {}, workspaceOpacity: {}, windowBlur: {}, workspaceBlur: {} }),
             updateRuntimeState: async () => true,
@@ -179,9 +182,13 @@ async function test(name, run) {
 
 async function main() {
     globalState.set('ext_version', 'config-test');
-    activate(context);
+    await activate(context);
     // Let startup's asynchronous patch check finish before setting a test image.
-    await new Promise(resolve => setImmediate(resolve));
+    const deadline = Date.now() + 5000;
+    do {
+        await new Promise(resolve => setTimeout(resolve, 10));
+        assert.ok(Date.now() < deadline, 'startup background work must finish');
+    } while (PickList.activeSelections || PickList.activeUpdates);
     assert.ok(commands.has('wallpaperStudio.setConfig'));
 
     await test('configuration mock retains the original snapshot after saving', async () => {

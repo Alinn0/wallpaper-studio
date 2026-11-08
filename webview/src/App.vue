@@ -67,6 +67,8 @@
         </el-tabs>
 
         <main class="studio-body">
+            <el-alert v-if="state.libraryError" :title="state.libraryError" type="error" :closable="false"
+                :description="t('libraryRecoveryHint')" show-icon />
             <!-- 首次激活时才挂载，之后保持挂载（v-show）以保留各 Tab 状态 -->
             <template v-for="tab in tabs" :key="tab.key">
                 <component
@@ -107,7 +109,7 @@ import { useTheme } from './composables/useTheme';
 import { useBridge } from './composables/useBridge';
 import { useI18n, setLocale, type Locale } from './composables/useI18n';
 import { applyState, brand, state } from './composables/useStore';
-import { clearThumbnailCache, hydrateThumbnails, setThumbnailReporter } from './composables/useThumbnailCache';
+import { clearThumbnailCache, hydrateThumbnails, setThumbnailReporter, setThumbnailReader, thumbnailCacheStats } from './composables/useThumbnailCache';
 import { disposeScenePreviewRuntime } from './composables/useScenePreview';
 
 const { t, locale } = useI18n();
@@ -257,6 +259,20 @@ bridge.on('toast', (data: any) => {
 
 // 缩略图跨重启复用：扩展侧持久化的首帧直接填充面板缓存，不再重新渲染。
 setThumbnailReporter((key, value) => bridge.post({ type: 'cacheThumbnail', key, value }));
+let thumbnailRequestId = 0;
+const thumbnailRequests = new Map<number, (data: Record<string, string>) => void>();
+setThumbnailReader(keys => new Promise(resolve => {
+    const requestId = ++thumbnailRequestId;
+    const timer = setTimeout(() => { thumbnailRequests.delete(requestId); resolve({}); }, 5000);
+    thumbnailRequests.set(requestId, data => { clearTimeout(timer); resolve(data); });
+    bridge.post({ type: 'readThumbnails', keys, requestId });
+}));
+bridge.on('thumbnailLookup', (data: any) => {
+    const resolve = thumbnailRequests.get(data.requestId);
+    thumbnailRequests.delete(data.requestId);
+    resolve?.(data.data || {});
+});
+(window as any).__wallpaperStudioThumbnailStats = thumbnailCacheStats;
 bridge.on('thumbnails', (data: any) => {
     hydrateThumbnails(data?.data as Record<string, string> | undefined);
 });

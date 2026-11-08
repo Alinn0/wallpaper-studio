@@ -1,4 +1,5 @@
 import * as fs from 'fs';
+import { mutateState } from './stateMutation';
 import * as path from 'path';
 import {
     DEFAULT_WALLPAPER_CONFIG,
@@ -12,7 +13,7 @@ import {
 import { getContext } from './global';
 import { getAppConfig } from './settingsStore';
 import { expandPathVariables, isSupportedMedia } from './pathUtil';
-import { isPathInsideFolder, samePath } from './pathComparison';
+import { normalizeComparablePath, samePath } from './pathComparison';
 
 /**
  * 来源模式：三种模式互斥。
@@ -47,11 +48,10 @@ export function getSourceMode(): SourceMode {
     }
 }
 
-export async function setSourceMode(mode: SourceMode): Promise<void> {
+export async function setSourceMode(mode: SourceMode, shouldPersist: () => boolean = () => true): Promise<void> {
     const context = getContext();
-    await context.globalState.update('wallpaperStudioSourceMode', mode);
-    // 历史键只保留"是否启用 Wallpaper 配置"，与模式保持同步，避免两边打架。
-    await context.globalState.update('wallpaperStudioWallpaperEnabled', mode === 'wallpaper');
+    await mutateState(context.globalState, 'wallpaperStudioSourceMode', DEFAULT_SOURCE_MODE,
+        current => shouldPersist() ? mode : current);
 }
 
 /** 当前模式是否是「Wallpaper 配置」且配置文件可用。 */
@@ -116,31 +116,39 @@ export function getFolderCandidates(): string[] {
     }
 }
 
-/**
- * 本地文件候选：最近使用列表里的条目，**严格**排除其它模式的成员。
- *
- * 排除两类：
- *   1. Wallpaper 播放列表里的项目；
- *   2. 当前目录媒体目录内的文件。
- *
- * 过滤后为空就返回空 —— 这里不再"兜底回退到包含目录文件的列表"。
- * 那个兜底会让本地文件模式重新抽到目录媒体里的壁纸，等于隔离失效；
- * 候选为空时上层会提示用户"请先选择壁纸"，语义更明确。
- */
+/** Explicitly imported files form a library, never a playback history. */
+export const LOCAL_FILES_KEY = 'wallpaperStudioLocalFiles';
+
+export function getLocalFiles(): string[] {
+    const stored = getContext().globalState.get<unknown>(LOCAL_FILES_KEY, []);
+    if (!Array.isArray(stored)) { return []; }
+    const seen = new Set<string>();
+    return stored.filter((item): item is string => {
+        if (typeof item !== 'string' || !item) { return false; }
+        const key = normalizeComparablePath(item);
+        if (seen.has(key)) { return false; }
+        seen.add(key);
+        return true;
+    });
+}
+
+export async function addLocalFiles(files: string[]): Promise<void> {
+    await mutateState(getContext().globalState, LOCAL_FILES_KEY, [] as string[], entries => {
+        for (const file of files) {
+            if (file && isSupportedMedia(file) && !entries.some(item => samePath(item, file))) { entries.push(file); }
+        }
+        return entries;
+    });
+}
+
+export async function removeLocalFile(file: string): Promise<void> {
+    await mutateState(getContext().globalState, LOCAL_FILES_KEY, [] as string[], entries => entries.filter(item => !samePath(item, file)));
+}
+
 export function getFileCandidates(): string[] {
-    let recent: string[] = [];
-    try {
-        recent = getContext().globalState.get<string[]>('wallpaperStudioRecentImages', []) || [];
-    } catch {
-        recent = [];
-    }
-    const wallpaperPaths = getWallpaperCandidates();
-    const withoutPlaylist = recent.filter(
-        item => !wallpaperPaths.some(candidate => samePath(candidate, item))
-    );
-    const folder = currentFolder();
-    if (!folder) { return withoutPlaylist; }
-    return withoutPlaylist.filter(item => !isPathInsideFolder(item, folder));
+    return getLocalFiles().filter(item => {
+        try { return isSupportedMedia(item) && fs.statSync(item).isFile(); } catch { return false; }
+    });
 }
 
 /** 指定模式下的可随机候选。 */

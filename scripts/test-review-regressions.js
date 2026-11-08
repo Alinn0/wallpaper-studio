@@ -29,11 +29,22 @@ async function test(name, run) {
     try { await run(); console.log(`PASS ${name}`); }
     catch (error) { failures++; console.error(`FAIL ${name}:`, error); }
 }
+async function waitFor(check) {
+    const deadline = Date.now() + 5000;
+    while (!check()) {
+        assert.ok(Date.now() < deadline, 'background installation did not start');
+        await new Promise(resolve => setTimeout(resolve, 5));
+    }
+}
 
 async function main() {
     await test('failed and superseded applications never persist; explicit empty path clears', async () => {
         let current = 'old.png', behavior = 'throw';
         const saves = [], notices = [], domOptions = [], pending = new Map();
+        const selection = require('../out/backgroundSelection');
+        const selections = [];
+        const subscription = selection.onDidChangeBackgroundSelection(() =>
+            selections.push(selection.getPendingBackgroundSelection('workspace')));
         const gs = new Map();
         const config = { imagePath: '', opacity: 0.2, blur: 0, sizeModel: 'cover', get: (key, fallback) => config[key] ?? fallback };
         const stubs = {
@@ -42,8 +53,11 @@ async function main() {
             './FileDom': { FileDom: class {
                 constructor(...args) { this.image = args[1]; this.requiresReload = false; domOptions.push(args); }
                 async install() {
+                    assert.equal(selections.at(-1), this.image, 'panel selection must be announced before expensive preparation starts');
                     if (behavior === 'throw') { throw Error('install failed'); }
-                    if (behavior === 'pending') { return new Promise(resolve => pending.set(this.image, resolve)); }
+                    if (behavior === 'pending') {
+                        return new Promise((resolve, reject) => { resolve.reject = reject; pending.set(this.image, resolve); });
+                    }
                     return behavior === 'success';
                 }
                 async clearBackground() { return true; }
@@ -52,7 +66,7 @@ async function main() {
                 get: (key, fallback) => gs.get(key) ?? fallback,
                 update: async (key, value) => gs.set(key, value)
             } }) },
-            './windowBackground': { getWorkspaceKey: () => 'workspace', resolveCurrentImagePath: () => current,
+            './windowBackground': { getPinnedImagePath: () => '', getWorkspaceKey: () => 'workspace', resolveCurrentImagePath: () => current,
                 resolveCurrentOpacity: value => value, resolveCurrentBlur: value => value,
                 setCurrentImagePath: async (value, options) => {
                     if (!options.shouldPersist || options.shouldPersist()) { saves.push(value); current = value; }
@@ -76,13 +90,53 @@ async function main() {
         assert.equal(current, '');
         behavior = 'pending';
         const old = PickList.applyBackgroundPath('slow.png');
+        await waitFor(() => pending.has('slow.png'));
+        assert.equal(selection.getPendingBackgroundSelection('workspace'), 'slow.png');
+        assert.equal(current, '', 'pending selection must not overwrite the actual background or history');
         const fresh = PickList.applyBackgroundPath('fresh.png');
+        assert.equal(selection.getPendingBackgroundSelection('workspace'), 'fresh.png');
+        await waitFor(() => pending.has('fresh.png'));
         pending.get('fresh.png')(true);
         assert.equal(await fresh, true);
         pending.get('slow.png')(true);
         assert.equal(await old, false);
         assert.equal(current, 'fresh.png');
         assert.ok(!saves.includes('slow.png'));
+        assert.equal(selection.getPendingBackgroundSelection('workspace'), undefined);
+        const older = PickList.applyBackgroundPath('older.png');
+        await waitFor(() => pending.has('older.png'));
+        const latest = PickList.applyBackgroundPath('latest.png');
+        pending.get('older.png')(true);
+        assert.equal(await older, false);
+        assert.equal(selection.getPendingBackgroundSelection('workspace'), 'latest.png', 'stale completion cannot clear the latest loading state');
+        await waitFor(() => pending.has('latest.png'));
+        pending.get('latest.png')(true);
+        assert.equal(await latest, true);
+        const failed = PickList.applyBackgroundPath('failed.png');
+        await waitFor(() => pending.has('failed.png'));
+        assert.equal(selection.getPendingBackgroundSelection('workspace'), 'failed.png');
+        pending.get('failed.png')(false);
+        assert.equal(await failed, false);
+        assert.equal(selection.getPendingBackgroundSelection('workspace'), undefined);
+        assert.equal(current, 'latest.png', 'failed loading rolls the UI back to the successfully applied wallpaper');
+        const closing = PickList.applyBackgroundPath('after-close.png');
+        await waitFor(() => pending.has('after-close.png'));
+        await new PickList(config).handleAction(7);
+        assert.equal(selection.getPendingBackgroundSelection('workspace'), undefined);
+        pending.get('after-close.png')(true);
+        assert.equal(await closing, false);
+        assert.equal(current, '', 'a cancelled request must never re-enable a closed background');
+        const cancelled = PickList.applyBackgroundPath('cancelled.png');
+        await waitFor(() => pending.has('cancelled.png'));
+        const replacement = PickList.applyBackgroundPath('replacement.png');
+        const noticeCount = notices.length;
+        pending.get('cancelled.png').reject(Error('superseded preparation'));
+        assert.equal(await cancelled, false);
+        assert.equal(notices.length, noticeCount, 'superseding a slow request must not show an error popup');
+        await waitFor(() => pending.has('replacement.png'));
+        pending.get('replacement.png')(true);
+        assert.equal(await replacement, true);
+        subscription.dispose();
     });
 
     await test('settings synchronize, merge concurrent writes, and roll back on disk failure', async () => {
@@ -103,6 +157,16 @@ async function main() {
         assert.equal(disk.opacity, 0.4);
         assert.equal(disk.blur, 12);
         assert.equal(disk.version, 3);
+        assert.equal('seeded' in disk, false);
+        assert.equal('forceHttpsUpgrade' in disk, false);
+        await B.getAppConfig().update('targetFps', 144);
+        A.reloadExternalSettings();
+        assert.equal(A.readSettings().targetFps, 144);
+        assert.ok(external.includes('targetFps'));
+        await A.getAppConfig().update('targetFps', 1);
+        assert.equal(A.readSettings().targetFps, 15);
+        await A.getAppConfig().update('targetFps', Infinity);
+        assert.equal(A.readSettings().targetFps, 15);
         const brokenFs = { ...fs, renameSync() { throw Object.assign(Error('disk failure'), { code: 'EPERM' }); } };
         const failed = load('out/settingsStore.js', { fs: brokenFs, vscode: { EventEmitter: Emitter },
             './atomicWrite': load('out/atomicWrite.js', { fs: brokenFs }) });
@@ -133,6 +197,13 @@ async function main() {
         let calls = 0;
         assert.equal(await runtime.updateRuntimeState(state => { calls++; state.workspaceImages.test = 'good.png'; }), true);
         assert.equal(calls, 1);
+        const runtimeFile = path.join(process.env.WALLPAPER_STUDIO_DATA_DIR, 'runtime.json');
+        const oldRuntime = JSON.parse(fs.readFileSync(runtimeFile, 'utf8'));
+        fs.writeFileSync(runtimeFile, JSON.stringify({ ...oldRuntime, windowOpacity: { old: 0.8 }, workspaceBlur: { old: 90 } }));
+        await runtime.updateRuntimeState(() => {});
+        const cleaned = JSON.parse(fs.readFileSync(runtimeFile, 'utf8'));
+        assert.equal('windowOpacity' in cleaned, false); assert.equal('workspaceBlur' in cleaned, false);
+        assert.equal(cleaned.workspaceImages.test, 'good.png');
         const brokenFs = { ...fs, renameSync() { throw Error('simulated rename failure'); } };
         const failed = load('out/runtimeStore.js', { './global': globals,
             './atomicWrite': load('out/atomicWrite.js', { fs: brokenFs }) });
@@ -150,11 +221,11 @@ async function main() {
             readRemovedWallpapers: () => [], readWallpaperPlaylistAsync: key => new Promise(resolve => pending.set(key, resolve)),
             rememberWallpaperPlaylist: (config, removed, user, entries) => cache.push({ config, paths: entries.map(entry => entry.path) }) };
         const stubs = { fs: { existsSync: () => true }, vscode: { commands: { executeCommand: async (...args) => commands.push(args) } },
-            './PickList': {}, './global': {}, './windowBackground': { resolveCurrentImagePath: () => history[0] },
+            './PickList': {}, './global': {}, './windowBackground': { resolveCurrentImagePath: () => history[0], getPreviousImagePath: () => history[2] },
             './settingsStore': { getAppConfig: () => ({ get: (key, fallback) => fallback }) },
             './sourceMode': { normalizeSourceMode: value => value, getCandidatesForMode: () => [history[0], history[2]] },
             './thumbnailStore': {}, './scenePreview': {}, './wallpaperEngine': engine, './runtimeStore': {} };
-        const { StudioViewProvider } = load('out/StudioViewProvider.js', stubs);
+        const { StudioViewProvider } = load('out/StudioViewProvider.js', { ...stubs, './sharedLibrary': {} });
         const object = Object.create(StudioViewProvider.prototype);
         Object.assign(object, { ctx: { globalState: gs }, sourceMode: 'file', wallpaperSyncGeneration: 0,
             wallpaperConfigPath: 'old.json', wallpaperUser: 'user', pushWallpaperLoadingProgress() {}, pushState() {} });
@@ -242,7 +313,7 @@ async function main() {
         } else { assert.match(commands[0], /^cp -f /); }
     });
 
-    await test('desktop scene URL stays inside the protocol app root while hash metadata stays in user storage', async () => {
+    await test('desktop scene uses a loopback capability and stores bytes only in user cache', async () => {
         const appRoot = path.join(process.env.WALLPAPER_STUDIO_DATA_DIR, 'protocol-app');
         const source = path.join(process.env.WALLPAPER_STUDIO_DATA_DIR, 'protocol-scene.pkg');
         const header = Buffer.alloc(12);
@@ -264,14 +335,46 @@ async function main() {
         object.writeGeneratedTextFile = async file => { htmlPath = file; };
         await object.saveWallpaperSceneRuntimeContent();
         const assets = path.join(appRoot, 'out', 'vs', 'workbench', 'wallpaper-studio-assets');
-        const packageFile = fs.readdirSync(assets).find(name => name.endsWith('.pkg'));
-        assert.ok(packageFile, 'serve .pkg from the allowed app resource root');
-        assert.equal(object.wallpaperSceneUrl, 'vscode-file://vscode-app' + path.join(assets, packageFile).replace(/\\/g, '/'));
-        assert.deepEqual(fs.readFileSync(path.join(assets, packageFile)), header);
+        assert.ok(!fs.existsSync(assets), 'do not create package copies in the installation');
+        assert.match(object.wallpaperSceneUrl, /^ws:\/\/127\.0\.0\.1:\d+\/[a-f0-9]{64}$/);
+        const cache = path.join(process.env.WALLPAPER_STUDIO_DATA_DIR, 'scene-assets');
+        const packageFile = fs.readdirSync(cache).find(name => name.endsWith('.pkg'));
+        assert.deepEqual(fs.readFileSync(path.join(cache, packageFile)), header);
         assert.equal(path.dirname(htmlPath), path.dirname(assets));
         assert.ok(!fs.existsSync(path.join(assets, '.sources')), 'metadata must not require installation-directory writes');
-        const indexes = path.join(process.env.WALLPAPER_STUDIO_DATA_DIR, 'scene-assets', '.sources');
-        assert.ok(fs.readdirSync(indexes).some(name => name.endsWith('.json')));
+        assert.ok(fs.existsSync(path.join(cache, 'index.json')));
+        const oldUrl = object.wallpaperSceneUrl;
+        fs.appendFileSync(source, Buffer.from('changed'));
+        await object.saveWallpaperSceneRuntimeContent();
+        assert.notEqual(object.wallpaperSceneUrl, oldUrl, 'changing the same source path must invalidate the renderer identity');
+        require('../out/sceneTransport').disposeSceneTransport();
+    });
+
+    await test('code-server media uses inline images and forwarded read-only video capabilities', async () => {
+        const root = path.join(process.env.WALLPAPER_STUDIO_DATA_DIR, 'server-app');
+        const workbench = path.join(root, 'out/vs/code/browser/workbench');
+        fs.mkdirSync(workbench, { recursive: true });
+        fs.writeFileSync(path.join(workbench, 'workbench.js'), '');
+        const forwarded = [];
+        const { FileDom } = load('out/FileDom.js', {
+            vscode: { env: { appRoot: root, appHost: 'web', uiKind: 2,
+                asExternalUri: async uri => { forwarded.push(uri.value); return {
+                    scheme: 'https', with: ({ scheme }) => ({ toString: () => scheme + '://forwarded.example/proxy/capability' })
+                }; } }, UIKind: { Desktop: 1, Web: 2 }, Uri: { parse: value => ({ value }) } },
+            './global': {}, './windowBackground': {}, './SudoPromptHelper': {},
+            './sceneTransport': { registerWallpaperAsset: async (_key, read) => {
+                assert.equal((await read()).toString(), 'test media'); return 'ws://127.0.0.1:3456/capability';
+            } }
+        });
+        const object = Object.create(FileDom.prototype);
+        const image = path.join(root, 'test.png'), video = path.join(root, 'test.mp4');
+        fs.writeFileSync(image, 'test media'); fs.writeFileSync(video, 'test media');
+        object.isVideo = false;
+        assert.match(await object.prepareCodeServerAsset(image), /^data:image\/png;base64,/);
+        object.isVideo = true;
+        assert.match(await object.prepareCodeServerAsset(video), /^wss:\/\/forwarded\.example\/proxy\/capability\?mime=video%2Fmp4$/);
+        assert.deepEqual(forwarded, ['http://127.0.0.1:3456/capability']);
+        assert.ok(!fs.existsSync(path.join(workbench, 'wallpaper-studio-assets')));
     });
 
     await test('unchanged scene package is reused without rewriting the cached copy', async () => {
@@ -300,4 +403,4 @@ async function main() {
     console.log(`Review regressions: ${failures} failed.`);
     process.exitCode = failures ? 1 : 0;
 }
-main().catch(error => { console.error(error); process.exitCode = 1; });
+main().catch(error => { console.error(error); process.exitCode = 1; }).finally(() => require('../out/sceneTransport').disposeSceneTransport());

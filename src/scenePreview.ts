@@ -1,13 +1,16 @@
 import * as fs from 'fs';
 import * as path from 'path';
 import { buildWallpaperScenePage } from './wallpaperScene';
+import { CACHE_ROOT } from './cachePaths';
+import { atomicWriteTextSync } from './atomicWrite';
+import { acquireFileLock } from './cancellation';
 
 /**
  * Studio 面板里的场景包预览需要一个能跑的 WebWallGL 页面。
  *
  * workbench 里那份 `wallpaper-studio-scene.html` 走 `vscode-file:`，webview 加载
  * 不了；这里把同一份内容（同模板 + 同运行时，只是同一份 HTML）写到扩展的
- * globalStorage 下，用 `webview.asWebviewUri` 直接当 iframe 源。好处是预览
+ * 用户统一缓存目录下，用 `webview.asWebviewUri` 直接当 iframe 源。好处是预览
  * 完全不依赖补丁是否已应用，且渲染链路与真实背景完全一致。
  */
 export const SCENE_PREVIEW_FILE_NAME = 'wallpaper-studio-scene.html';
@@ -29,9 +32,12 @@ export interface ScenePreviewPage {
  */
 export async function ensureWallpaperScenePreviewPage(
     extensionPath: string,
-    globalStoragePath: string
+    cacheRoot = CACHE_ROOT
 ): Promise<ScenePreviewPage> {
-    const dir = path.join(globalStoragePath, SCENE_PREVIEW_DIR);
+    const dir = path.join(cacheRoot, SCENE_PREVIEW_DIR);
+    await fs.promises.mkdir(dir, { recursive: true });
+    const release = await acquireFileLock(dir);
+    try {
     const filePath = path.join(dir, SCENE_PREVIEW_FILE_NAME);
     const cached = ensured;
     if (cached && cached.dir === dir && fs.existsSync(cached.file) && readStamp(cached.file) === cached.stamp) {
@@ -45,10 +51,25 @@ export async function ensureWallpaperScenePreviewPage(
     }
 
     await fs.promises.mkdir(dir, { recursive: true });
-    await fs.promises.writeFile(filePath, html, 'utf8');
-    await fs.promises.writeFile(path.join(dir, SCENE_PREVIEW_STAMP_FILE), stamp, 'utf8');
+    atomicWriteTextSync(filePath, html);
+    atomicWriteTextSync(path.join(dir, SCENE_PREVIEW_STAMP_FILE), stamp);
     ensured = { dir, file: filePath, stamp };
     return { filePath, regenerated: true };
+    } finally { await release(); }
+}
+
+export async function clearWallpaperScenePreview(): Promise<void> {
+    const dir = path.join(CACHE_ROOT, SCENE_PREVIEW_DIR);
+    await fs.promises.mkdir(dir, { recursive: true });
+    const release = await acquireFileLock(dir);
+    try {
+        ensured = undefined;
+        for (const name of await fs.promises.readdir(dir)) {
+            if ([SCENE_PREVIEW_FILE_NAME, SCENE_PREVIEW_STAMP_FILE].includes(name) || /^wallpaper-studio-scene\.(?:html|stamp)\..+\.tmp$/.test(name)) {
+                await fs.promises.unlink(path.join(dir, name));
+            }
+        }
+    } finally { await release(); }
 }
 
 /** 记录在独立 stamp 文件里，避免改动 HTML 正文结构。 */

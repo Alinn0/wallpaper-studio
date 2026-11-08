@@ -1,6 +1,5 @@
 import * as crypto from 'crypto';
 import * as fs from 'fs';
-import * as os from 'os';
 import * as path from 'path';
 import { spawn } from 'child_process';
 import {
@@ -19,9 +18,15 @@ import {
 } from 'vscode';
 import { PickList } from './PickList';
 import { onDidChangeGlobalState } from './global';
-import { ensureWorkspaceRecord, resolveCurrentBlur, resolveCurrentImagePath, resolveCurrentOpacity } from './windowBackground';
+import { getLibraryError, onDidChangeLibrary, onDidChangeLibraryStatus, resetSharedLibrary } from './sharedLibrary';
+import { getPendingBackgroundSelection, onDidChangeBackgroundSelection, cancelBackgroundSelection } from './backgroundSelection';
+import { backupWallpaperState, clearAllWallpaperCaches } from './cacheMaintenance';
+import { onDidChangeRuntime } from './runtimeStore';
+import { mutateState } from './stateMutation';
+import { ensureWorkspaceRecord, resolveCurrentBlur, resolveCurrentImagePath, resolveCurrentOpacity, getPreviousImagePath, getPinnedImagePath, getWorkspaceKey } from './windowBackground';
 import { expandPathVariables } from './pathUtil';
 import { ensureWallpaperScenePreviewPage } from './scenePreview';
+import { CACHE_ROOT } from './cachePaths';
 import {
     DEFAULT_WALLPAPER_CONFIG,
     WallpaperEntry,
@@ -29,6 +34,7 @@ import {
     hasWallpaperConfig,
     readRemovedWallpapers,
     getWallpaperProjectProperties,
+    getWallpaperProjectTitle,
     getWallpaperProjectDeclaration,
     removeWallpaper,
     readWallpaperPlaylistAsync,
@@ -39,7 +45,7 @@ import {
     setWallpaperProperties
 } from './wallpaperEngine';
 import { clearWallpaperProjectCache, WALLPAPER_USER_KEY } from './wallpaperEngine';
-import { resolveActiveWallpaperUser } from './wallpaperEngine';
+import { resolveActiveWallpaperUser, readWallpaperResourceDirectories } from './wallpaperEngine';
 import { isWallpaperPkgPath } from './wallpaperPkg';
 import {
     DEFAULT_SOURCE_MODE,
@@ -47,10 +53,13 @@ import {
     getCandidatesForMode,
     getRandomCandidates,
     normalizeSourceMode,
-    setSourceMode
+    setSourceMode,
+    getLocalFiles,
+    removeLocalFile,
+    LOCAL_FILES_KEY
 } from './sourceMode';
 import { ThumbnailStore } from './thumbnailStore';
-import { getAppConfig, onDidChangeSettings, resetSettings } from './settingsStore';
+import { getAppConfig, onDidChangeSettings, resetSettings, saveDisplayFps } from './settingsStore';
 import { isWebviewMessage, WebviewMessage } from './webviewProtocol';
 import { createSceneRenderConfig } from './sceneRender';
 import { resolveBlendModeValue } from './backgroundCss';
@@ -102,7 +111,6 @@ export class StudioViewProvider implements WebviewViewProvider {
     /** Folder listing cache keyed by folder path + mtime; avoids readdir on every push. */
     private folderCache?: { folder: string; mtimeMs: number; names: string[] };
     private wallpaperConfigPath = DEFAULT_WALLPAPER_CONFIG;
-    private wallpaperConfigEnabled = false;
     private sourceMode: 'file' | 'folder' | 'wallpaper' = 'file';
     private wallpaperEntries: WallpaperEntry[] = [];
     /** 上次读取的壁纸引擎用户节点；变了就说明换了账号，必须整份重读。 */
@@ -125,6 +133,7 @@ export class StudioViewProvider implements WebviewViewProvider {
     /** 已完成的读取结果；文件签名、用户或移除名单变化时自动失效。 */
     private wallpaperCompletedKey = '';
     private wallpaperSyncGeneration = 0;
+    private sourceModeGeneration = 0;
     /** 图库页按需加载；首页首屏不发送大量列表数据。 */
     private galleryRequested = false;
     /** 上次推送给面板的背景路径，用来判断"是否换壁纸了"，从而跳过防抖立刻推送。 */
@@ -134,25 +143,28 @@ export class StudioViewProvider implements WebviewViewProvider {
     /** 面板上报的缩略图写入合并成一次落盘，避免拖动时反复写文件。 */
     private thumbnailWriteTimer?: ReturnType<typeof setTimeout>;
     private readonly pendingThumbnails = new Map<string, string>();
+    private resetting = false;
+    private rootsUpdatePending = false;
 
     constructor(private readonly ctx: ExtensionContext) {
-        // globalStorageUri 在真实环境一定存在；单测里的 mock context 可能没有，
-        // 退化到临时目录，避免构造阶段直接抛错。
-        const storageRoot = this.ctx.globalStorageUri?.fsPath
-            || path.join(os.tmpdir(), 'wallpaper-studio-storage');
-        this.thumbnails = new ThumbnailStore(storageRoot);
+        this.thumbnails = new ThumbnailStore(CACHE_ROOT);
+        this.ctx.subscriptions?.push(onDidChangeBackgroundSelection(() => this.pushState(false)));
+        this.ctx.subscriptions?.push(onDidChangeRuntime(() => this.pushState(false)));
+        this.ctx.subscriptions?.push(onDidChangeLibraryStatus(() => this.pushState(false)));
         this.wallpaperConfigPath = this.ctx.globalState.get<string>(
             'wallpaperStudioWallpaperConfig',
             DEFAULT_WALLPAPER_CONFIG
         );
-        this.wallpaperConfigEnabled = this.ctx.globalState.get<boolean>('wallpaperStudioWallpaperEnabled', true);
         // 默认使用 Wallpaper Engine 播放列表；用户切到其他模式后才记住其他值。
         this.sourceMode = this.ctx.globalState.get<'file' | 'folder' | 'wallpaper'>(
             'wallpaperStudioSourceMode',
             'wallpaper'
         );
-        // 默认模式的一次性迁移；预热由扩展激活处调用 prewarm()（避免重复执行）。
-        void this.applyDefaultModeOnce();
+        // Listen even before the panel opens so shared properties affect live backgrounds.
+        this.ctx.subscriptions?.push(onDidChangeLibrary(keys => {
+            void this.refreshSharedLibrary(keys).catch(error =>
+                console.warn('[WallpaperStudio] Shared library refresh failed:', error));
+        }));
     }
 
     /**
@@ -172,23 +184,25 @@ export class StudioViewProvider implements WebviewViewProvider {
         }
     }
 
-    /**
-     * 一次性把默认来源模式切换为「Wallpaper 配置」。
-     *
-     * 老版本把默认写成 file，并且这个值已经落进 globalState，光改代码里的默认值
-     * 不会生效。这里清掉那两个键（让新的默认值生效）后打一个标记，只做一次，
-     * 之后用户在 UI 里的选择依然会被记住。
-     */
-    private async applyDefaultModeOnce(): Promise<void> {
-        const key = 'wallpaperStudioDefaultModeWallpaper';
-        if (this.ctx.globalState.get<boolean>(key, false)) { return; }
-        await this.ctx.globalState.update('wallpaperStudioSourceMode', undefined);
-        await this.ctx.globalState.update('wallpaperStudioWallpaperEnabled', undefined);
-        await this.ctx.globalState.update(key, true);
-        this.wallpaperConfigEnabled = true;
-        this.sourceMode = 'wallpaper';
+    private async refreshSharedLibrary(keys: string[]): Promise<void> {
+        if (this.resetting) { return; }
+        const gs = this.ctx.globalState;
+        const previousMode = this.sourceMode;
+        this.sourceMode = normalizeSourceMode(gs.get('wallpaperStudioSourceMode'));
+        if (this.sourceMode !== previousMode) { this.sourceModeGeneration++; }
+        this.wallpaperConfigPath = gs.get('wallpaperStudioWallpaperConfig', DEFAULT_WALLPAPER_CONFIG);
+        const propertiesOnly = keys.every(key => key === 'wallpaperStudioWallpaperProperties');
+        const discoveringUser = keys.length === 1 && keys[0] === WALLPAPER_USER_KEY
+            && this.wallpaperSyncPromise && this.wallpaperUser === gs.get<string>(WALLPAPER_USER_KEY, '');
+        if (!propertiesOnly && !discoveringUser && this.galleryRequested && this.sourceMode === 'wallpaper') {
+            await this.syncWallpaperPlaylist();
+        }
+        if (keys.includes('wallpaperStudioWallpaperProperties')) {
+            const current = resolveCurrentImagePath(getAppConfig().get<string>('imagePath') || '');
+            if (current) { this.scheduleWallpaperPropertyApply(current); }
+        }
+        this.pushState(!propertiesOnly);
     }
-
 
     public resolveWebviewView(
         view: WebviewView,
@@ -196,13 +210,14 @@ export class StudioViewProvider implements WebviewViewProvider {
         _token: CancellationToken
     ): void {
         this.view = view;
+        this.sourceMode = normalizeSourceMode(this.ctx.globalState.get('wallpaperStudioSourceMode'));
+        this.wallpaperConfigPath = this.ctx.globalState.get<string>('wallpaperStudioWallpaperConfig', DEFAULT_WALLPAPER_CONFIG);
         this.seedAllowedRoots();
         view.webview.options = {
             enableScripts: true,
             localResourceRoots: this.computeRootUris()
         };
         view.webview.html = this.getHtml(view.webview);
-        this.wallpaperConfigPath = this.ctx.globalState.get<string>('wallpaperStudioWallpaperConfig', DEFAULT_WALLPAPER_CONFIG);
 
         // 首页只同步当前设置；列表由 loadGallery 按需读取。
         this.pushState();
@@ -281,12 +296,18 @@ export class StudioViewProvider implements WebviewViewProvider {
         const cfg = getAppConfig();
         const gs = this.ctx.globalState;
 
-        const imagePath = resolveCurrentImagePath(cfg.get<string>('imagePath') || '');
+        const pendingPath = getPendingBackgroundSelection(getWorkspaceKey());
+        const imagePath = pendingPath ?? resolveCurrentImagePath(cfg.get<string>('imagePath') || '');
         this.lastPushedImagePath = imagePath;
         const imagePathDisplay = this.toWebviewUri(imagePath);
-        const wallpaperMode = this.wallpaperConfigEnabled && hasWallpaperConfig(this.wallpaperConfigPath);
-        const imagePathLabel = wallpaperMode
-            ? (this.wallpaperEntries.find(entry => entry.path === imagePath)?.title || this.basename(imagePath))
+        const mode = this.currentSourceMode();
+        const wallpaperMode = mode === 'wallpaper' && hasWallpaperConfig(this.wallpaperConfigPath);
+        // Home can open before the gallery is requested. Read the current project's
+        // cached title independently, then use a normalized playlist match as fallback.
+        const imagePathLabel = wallpaperMode && imagePath
+            ? (getWallpaperProjectTitle(imagePath)
+                || this.wallpaperEntries.find(entry => normalizeComparablePath(entry.path) === normalizeComparablePath(imagePath))?.title
+                || this.basename(imagePath))
             : '';
         // 当前背景的完整 Wallpaper Engine 配置项：三种来源共用同一份解析结果，
         // 不再依赖首页去列表里按路径反查（路径归一化不一致时会查不到）。
@@ -298,15 +319,7 @@ export class StudioViewProvider implements WebviewViewProvider {
             imagePath
         );
         const imageProject = getWallpaperProjectDeclaration(imagePath);
-        const wallpaperPaths = new Set(this.wallpaperEntries.map(entry => normalizeComparablePath(entry.path)));
-        const recentStored = gs.get<string[]>('wallpaperStudioRecentImages', []) || [];
-        const currentFolder = expandPathVariables(cfg.get<string>('randomImageFolder') || '');
-        const recentRaw = this.sourceMode === 'wallpaper'
-            ? recentStored.filter(item => wallpaperPaths.has(normalizeComparablePath(item)))
-            : this.sourceMode === 'folder'
-                ? recentStored.filter(item => currentFolder && this.isPathInFolder(item, currentFolder))
-                : recentStored.filter(item => !wallpaperPaths.has(normalizeComparablePath(item)));
-        const recentImages = includeGallery && this.galleryRequested ? recentRaw.map(p => ({
+        const localFiles = includeGallery && this.galleryRequested ? getLocalFiles().map(p => ({
             path: p,
             display: this.toWebviewUri(p),
             name: this.basename(p),
@@ -321,7 +334,7 @@ export class StudioViewProvider implements WebviewViewProvider {
         let folderImages: { path: string; display: string; name: string }[] = [];
         let folderImagesTotal = 0;
         try {
-            if (includeGallery && this.galleryRequested && !wallpaperMode && folder && fs.existsSync(folder) && fs.statSync(folder).isDirectory()) {
+            if (includeGallery && this.galleryRequested && mode === 'folder' && folder && fs.existsSync(folder) && fs.statSync(folder).isDirectory()) {
                 const names = this.listFolder(folder);
                 folderImagesTotal = names.length;
                 folderImages = names.slice(0, 2000).map(name => {
@@ -364,8 +377,10 @@ export class StudioViewProvider implements WebviewViewProvider {
                     opacity: resolveCurrentOpacity(cfg.get('opacity') ?? 0),
                     blur: resolveCurrentBlur(cfg.get('blur') ?? 0),
                     imagePath,
+                    imageLoading: pendingPath !== undefined,
                     imagePathDisplay,
                     imagePathLabel,
+                    pinnedImagePath: getPinnedImagePath(),
                     imageProperties,
                     imageProject,
                     sceneRender: imagePath && isWallpaperPkgPath(imagePath)
@@ -381,6 +396,8 @@ export class StudioViewProvider implements WebviewViewProvider {
                         : undefined,
                     autoStatus: cfg.get('autoStatus') ?? false,
                     autoInterval: cfg.get('autoInterval') ?? 0,
+                    targetFps: cfg.get('targetFps') ?? 60,
+                    maxFps: cfg.get('maxFps') ?? 0,
                     sizeModel: cfg.get('sizeModel') ?? 'cover',
                     blendModel: cfg.get('blendModel') ?? 'auto',
                     randomImageFolder: cfg.get('randomImageFolder') ?? '',
@@ -388,8 +405,9 @@ export class StudioViewProvider implements WebviewViewProvider {
                     backgroundTransition: true
                 },
                 state: {
-                    sourceMode: wallpaperMode ? 'wallpaper' : this.sourceMode,
-                    recentImages,
+                    libraryError: getLibraryError(),
+                    sourceMode: mode,
+                    localFiles,
                     folderImages,
                     folderImagesTotal,
                     wallpaperConfigEnabled: wallpaperMode,
@@ -426,7 +444,7 @@ export class StudioViewProvider implements WebviewViewProvider {
         };
         if (!includeGallery) {
             const summary: Record<string, unknown> = message.data.state;
-            for (const key of ['recentImages', 'folderImages', 'folderImagesTotal', 'wallpaperPlaylist']) { delete summary[key]; }
+            for (const key of ['localFiles', 'folderImages', 'folderImagesTotal', 'wallpaperPlaylist']) { delete summary[key]; }
         }
         void this.view.webview.postMessage(message);
     }
@@ -465,26 +483,30 @@ export class StudioViewProvider implements WebviewViewProvider {
     /** 把扩展侧保存的缩略图推给面板（面板重新打开时直接复用，不重新渲染）。 */
     private async pushThumbnails(): Promise<void> {
         if (!this.view) { return; }
+        const view = this.view;
         try {
-            const data = await this.thumbnails.snapshot();
-            if (!this.view || !Object.keys(data).length) { return; }
-            void this.view.webview.postMessage({ type: 'thumbnails', data });
+            const source = this.toWebviewUri(getPendingBackgroundSelection(getWorkspaceKey()) ?? resolveCurrentImagePath());
+            const data = await this.thumbnails.snapshot(source ? ['image:', 'video:', 'scene:'].map(prefix => prefix + source) : []);
+            if (this.view !== view) { return; }
+            void view.webview.postMessage({ type: 'thumbnails', data });
         } catch (error) {
             console.warn('[WallpaperStudio] Failed to push thumbnails:', error);
+            if (this.view === view) { void view.webview.postMessage({ type: 'thumbnails', data: {} }); }
         }
     }
 
     /** 合并写入：面板滚动/批量渲染时会连续上报很多张。 */
     private queueThumbnailWrite(key: string, value: string): void {
+        if (this.resetting) { return; }
         this.pendingThumbnails.set(key, value);
-        if (this.thumbnailWriteTimer) { clearTimeout(this.thumbnailWriteTimer); }
+        if (this.thumbnailWriteTimer) { return; }
         this.thumbnailWriteTimer = setTimeout(() => {
             this.thumbnailWriteTimer = undefined;
             const batch = Array.from(this.pendingThumbnails);
             this.pendingThumbnails.clear();
             void this.thumbnails.setMany(batch).catch(error =>
                 console.warn('[WallpaperStudio] Thumbnail batch failed:', error));
-        }, 800);
+        }, 100);
     }
 
     /**
@@ -581,7 +603,7 @@ export class StudioViewProvider implements WebviewViewProvider {
     /**
      * 补齐「视角」相关的属性项。
      *
-     * 视角值按**壁纸路径**独立保存在 globalState 的覆盖表里，但读取时必须出现在
+     * 视角值按**壁纸路径**保存在共享 library.json 的覆盖表里，读取时必须出现在
      * `imageProperties` 里才能被面板识别。没有 `project.json` 的壁纸（视频、图片、
      * 目录媒体）属性列表是空的 —— 那些壁纸调整过视角后，值虽然存下来了，
      * 却因为这里不返回而读不回来，表现为"换了壁纸再换回来，视角丢了"。
@@ -614,10 +636,6 @@ export class StudioViewProvider implements WebviewViewProvider {
         return result;
     }
 
-    private isPathInFolder(value: string, folder: string): boolean {
-        return isPathInsideFolder(value, folder);
-    }
-
     private normalizePath(value: string): string {
         return normalizeComparablePath(value);
     }
@@ -647,6 +665,7 @@ export class StudioViewProvider implements WebviewViewProvider {
     private async handleMessage(value: unknown): Promise<void> {
         if (!isWebviewMessage(value)) { return; }
         const msg: WebviewMessage = value;
+        if (this.resetting && msg.type !== 'ready') { this.toast('正在重置，请稍后再操作', 'warning'); return; }
         switch (msg.type) {
             case 'ready':
                 this.pushState();
@@ -671,36 +690,57 @@ export class StudioViewProvider implements WebviewViewProvider {
             case 'setSourceMode':
                 if (msg.mode === 'file' || msg.mode === 'folder' || msg.mode === 'wallpaper') {
                     const mode = normalizeSourceMode(msg.mode);
+                    const generation = this.sourceModeGeneration = (this.sourceModeGeneration || 0) + 1;
+                    const isCurrent = () => generation === this.sourceModeGeneration && this.currentSourceMode() === mode;
+                    cancelBackgroundSelection();
                     this.sourceMode = mode;
-                    // setSourceMode 会同时同步历史键 wallpaperStudioWallpaperEnabled，
-                    // 避免"模式"与"是否启用播放列表"两套判定打架。
-                    await setSourceMode(mode);
+                    // 所有窗口读取同一份来源模式。
+                    await setSourceMode(mode, isCurrent);
+                    if (!isCurrent()) { return; }
+                    this.pushState();
                     if (mode === 'wallpaper') {
-                        this.wallpaperConfigEnabled = true;
                         await this.syncWallpaperPlaylist();
+                        if (!isCurrent()) { return; }
                         // 播放列表空/找不到用户时明确提示，不要停在"什么都没有"。
                         this.notifyWallpaperNotice();
-                    } else {
-                        this.wallpaperConfigEnabled = false;
                     }
                     // 切模式后只使用新模式自己的候选；没有候选时必须清空旧模式背景，
                     // 避免首页继续显示上一模式的路径和预览。
                     const candidates = this.getModeCandidates(mode);
                     if (candidates.length) {
                         const selected = candidates[Math.floor(Math.random() * candidates.length)];
-                        await commands.executeCommand('wallpaperStudio.setConfig', 'wallpaperStudio.imagePath', selected);
+                        await PickList.applyBackgroundPath(selected, { isCurrent });
                     } else {
-                        await commands.executeCommand('wallpaperStudio.runAction', 7);
+                        await PickList.applyBackgroundPath('', { isCurrent });
                     }
                     this.pushState();
                 }
                 return;
+
+            case 'readThumbnails': {
+                const view = this.view;
+                if (!view || !Array.isArray(msg.keys) || !Number.isSafeInteger(msg.requestId)) { return; }
+                const keys = msg.keys.filter(key => typeof key === 'string' && key.length <= 10000).slice(0, 64);
+                try {
+                    const data = await this.thumbnails.snapshot(keys);
+                    if (this.view === view) { void view.webview.postMessage({ type: 'thumbnailLookup', requestId: msg.requestId, data }); }
+                } catch (error) {
+                    console.warn('[WallpaperStudio] Thumbnail lookup failed:', error);
+                    if (this.view === view) { void view.webview.postMessage({ type: 'thumbnailLookup', requestId: msg.requestId, data: {} }); }
+                }
+                return;
+            }
 
             case 'runAction':
                 if (typeof msg.action === 'number') {
                     await commands.executeCommand('wallpaperStudio.runAction', msg.action, msg.path);
                     this.pushState();
                 }
+                return;
+
+            case 'saveDisplayFps':
+                if (await saveDisplayFps(msg.maxFps, msg.overwrite === true)) { PickList.needAutoUpdate(getAppConfig()); }
+                this.pushState();
                 return;
 
             case 'setConfig':
@@ -718,11 +758,6 @@ export class StudioViewProvider implements WebviewViewProvider {
                 }
                 return;
 
-            case 'clearRecentImages':
-                await this.ctx.globalState.update('wallpaperStudioRecentImages', []);
-                this.pushState();
-                return;
-
             case 'selectWallpaperConfig': {
                 const selected = await window.showOpenDialog({
                     canSelectFiles: true,
@@ -734,12 +769,10 @@ export class StudioViewProvider implements WebviewViewProvider {
                 const filePath = selected?.[0]?.fsPath;
                 if (!filePath) { return; }
                 this.wallpaperConfigPath = filePath;
-                this.wallpaperConfigEnabled = true;
                 this.sourceMode = 'wallpaper';
                 // 换了 config.json 就可能换了账号，用户缓存必须作废。
                 this.wallpaperUser = '';
                 await this.ctx.globalState.update('wallpaperStudioWallpaperConfig', filePath);
-                await this.ctx.globalState.update('wallpaperStudioWallpaperEnabled', true);
                 await this.ctx.globalState.update('wallpaperStudioSourceMode', 'wallpaper');
                 await this.ctx.globalState.update('wallpaperStudioWallpaperRemoved', []);
                 await getAppConfig().update('randomImageFolder', '', true);
@@ -770,7 +803,7 @@ export class StudioViewProvider implements WebviewViewProvider {
 
             case 'randomWallpaper': {
                 // 随机换一张时用来排除当前壁纸，同样要读真正生效的路径。
-                const current = resolveCurrentImagePath(
+                const current = getPendingBackgroundSelection(getWorkspaceKey()) ?? resolveCurrentImagePath(
                     getAppConfig().get<string>('imagePath') || ''
                 );
                 // 只在当前模式内抽，并排除当前这张。
@@ -786,39 +819,25 @@ export class StudioViewProvider implements WebviewViewProvider {
             }
 
             case 'previousWallpaper': {
-                // 设置里的 imagePath 只在首次选择时写入，之后一律走 globalState 记录，
-                // 必须用 resolveCurrentImagePath 才能拿到真正在显示的壁纸。
-                const current = resolveCurrentImagePath(
-                    getAppConfig().get<string>('imagePath') || ''
-                );
-                const mode = this.currentSourceMode();
-                const history = this.ctx.globalState.get<string[]>('wallpaperStudioRecentImages', []) || [];
-                const currentKey = this.normalizePath(current);
-                const index = current ? history.findIndex(item => this.normalizePath(item) === currentKey) : -1;
-                // 只在「当前壁纸之后」找上一张；历史里越靠前越新。
-                const candidates = index >= 0 ? history.slice(index + 1) : history.slice();
-                if (!candidates.length) {
-                    this.toast('没有上一张壁纸了', 'warning');
-                    return;
-                }
-                // 上一张必须是同一配置模式里「可用」的壁纸；跨模式不允许。
-                // 用 isInMode 而不是互斥的 modeOfPath：同一文件既在最近列表、
-                // 又在目录里时，两种模式都应该能回退到它。
-                const pool = new Set(this.getModeCandidates(mode).map(item => this.normalizePath(item)));
-                const next = candidates.find(item => pool.has(this.normalizePath(item)) && fs.existsSync(item));
-                if (!next) {
-                    this.toast(`不能跨模式切换：上一张来自「${this.modeLabel(this.modeOfPath(candidates[0]))}」`, 'error');
-                    return;
-                }
-                if (this.normalizePath(next) === currentKey) {
-                    // 历史里只有这一张（或前后都是它）：静默返回会让用户以为按钮坏了。
-                    this.toast('没有更早的壁纸了', 'info');
+                const next = getPreviousImagePath();
+                const current = resolveCurrentImagePath();
+                const pool = this.getModeCandidates(this.currentSourceMode());
+                if (!next || this.normalizePath(next) === this.normalizePath(current)
+                    || !fs.existsSync(next) || !pool.some(item => this.normalizePath(item) === this.normalizePath(next))) {
+                    this.toast('当前模式没有可恢复的上一张壁纸', 'warning');
                     return;
                 }
                 await commands.executeCommand('wallpaperStudio.setConfig', 'wallpaperStudio.imagePath', next);
                 this.pushState();
                 return;
             }
+
+            case 'setWallpaperPinned':
+                if (typeof msg.path === 'string' && typeof msg.pinned === 'boolean' && msg.path) {
+                    await PickList.setWallpaperPinned(msg.path, msg.pinned);
+                    this.pushState(false);
+                }
+                return;
 
             case 'useWallpaper':
                 if (typeof msg.path === 'string') {
@@ -839,27 +858,16 @@ export class StudioViewProvider implements WebviewViewProvider {
                 if (typeof msg.path === 'string') {
                     const target = msg.path;
                     const key = this.normalizePath(target);
-                    const recent = this.ctx.globalState.get<string[]>('wallpaperStudioRecentImages', []) || [];
-                    // 三种模式都只从「列表 + 轮播池」里移除：要么记进 globalState 的
-                    // 已移除清单，要么从最近列表里删掉。绝不修改 Wallpaper 的 config.json，
-                    // 也不动磁盘上的壁纸文件。
+                    // 仅移除对应来源的成员资格，不修改原始壁纸文件。
                     if (msg.mode === 'wallpaper') {
                         await removeWallpaper(this.ctx.globalState, target);
                         await this.syncWallpaperPlaylist();
                     } else if (msg.mode === 'folder') {
-                        const removed = this.ctx.globalState.get<string[]>('wallpaperStudioFolderRemoved', []) || [];
-                        if (!removed.some(item => this.normalizePath(item) === key)) {
-                            await this.ctx.globalState.update('wallpaperStudioFolderRemoved', [...removed, target]);
-                        }
+                        await mutateState(this.ctx.globalState, 'wallpaperStudioFolderRemoved', [] as string[], removed =>
+                            removed.some(item => this.normalizePath(item) === key) ? removed : [...removed, target]);
                         this.folderCache = undefined;
                     }
-                    // 最近播放历史里也去掉，否则「上一张」会把它切回来。
-                    if (recent.some(item => this.normalizePath(item) === key)) {
-                        await this.ctx.globalState.update(
-                            'wallpaperStudioRecentImages',
-                            recent.filter(item => this.normalizePath(item) !== key)
-                        );
-                    }
+                    if (msg.mode === 'file') { await removeLocalFile(target); }
                     // 移除的正好是当前壁纸：自动切到同模式下仍可用的一张，
                     // 避免界面显示"一个已经不在列表里"的壁纸。
                     const current = resolveCurrentImagePath(
@@ -941,6 +949,7 @@ export class StudioViewProvider implements WebviewViewProvider {
     }
 
     private async flushWallpaperProperties(): Promise<void> {
+        if (this.resetting) { return; }
         if (this.wallpaperPropertyApplying) {
             this.wallpaperPropertyDirty = true;
             return;
@@ -978,14 +987,26 @@ export class StudioViewProvider implements WebviewViewProvider {
 
     /** 高级页的「清除所有缓存与配置」：把扩展侧所有状态、缓存和设置恢复默认。 */
     private async resetAllState(): Promise<void> {
+        if (this.resetting) { return; }
+        this.resetting = true;
+        try {
+        await backupWallpaperState();
+        cancelBackgroundSelection();
+        PickList.stopAutoRandomTask();
+        if (this.wallpaperPropertyApplyTimer) { clearTimeout(this.wallpaperPropertyApplyTimer); this.wallpaperPropertyApplyTimer = undefined; }
+        this.wallpaperPropertyDirty = false;
         this.wallpaperSyncGeneration++;
         this.wallpaperSyncPromise = undefined;
         this.wallpaperCompletedKey = '';
         if (this.thumbnailWriteTimer) { clearTimeout(this.thumbnailWriteTimer); }
         this.pendingThumbnails.clear();
+        await getAppConfig().update('autoStatus', false, true);
+        if (!(await PickList.applyBackgroundPath('', { silent: true }))) { throw Error('背景未能关闭，重置未完成，请重试'); }
+        await resetSharedLibrary();
         if (!(await clearRuntimeState())) { throw new Error('Failed to reset background state'); }
         await ensureWorkspaceRecord();
         const stateKeys = [
+            LOCAL_FILES_KEY,
             'wallpaperStudioRecentImages',
             'wallpaperStudioWallpaperRemoved',
             'wallpaperStudioWallpaperProperties',
@@ -993,6 +1014,7 @@ export class StudioViewProvider implements WebviewViewProvider {
             'wallpaperStudioOnlineFolder',
             'wallpaperStudioOnlineImageList',
             'wallpaperStudioWallpaperConfig',
+            WALLPAPER_USER_KEY,
             'wallpaperStudioWallpaperEnabled',
             'wallpaperStudioSourceMode',
             'wallpaperStudioSingleImageSource',
@@ -1007,9 +1029,10 @@ export class StudioViewProvider implements WebviewViewProvider {
             'wallpaperStudioCacheReset20261101-v2'
         ];
         for (const key of stateKeys) {
-            try { await this.ctx.globalState.update(key, undefined); } catch { /* 单个 key 清理失败不影响其余 */ }
+            await this.ctx.globalState.update(key, undefined);
         }
-        try { this.thumbnails.clear(); } catch { /* 忽略 */ }
+        await this.thumbnails.clear();
+        await clearAllWallpaperCaches();
 
         this.wallpaperEntries = [];
         this.wallpaperUser = '';
@@ -1020,50 +1043,22 @@ export class StudioViewProvider implements WebviewViewProvider {
         this.wallpaperTotal = 0;
         this.wallpaperLoadedOnce = false;
         this.wallpaperConfigPath = DEFAULT_WALLPAPER_CONFIG;
-        this.wallpaperConfigEnabled = true;
         this.sourceMode = DEFAULT_SOURCE_MODE;
         this.folderCache = undefined;
 
-        // 设置文件一并删除并重建为默认值（含默认模式 wallpaper、透明度/模糊度 0）。
-        try { await resetSettings(); } catch (error) {
-            console.warn('[WallpaperStudio] Failed to reset settings:', error);
-        }
+        await resetSettings();
 
         // 面板侧的缩略图 / 场景首帧 / 界面偏好也要一起丢掉。
         try { await this.view?.webview.postMessage({ type: 'purgeLocalCache' }); } catch { /* view 可能已销毁 */ }
-        // 关闭背景：会清掉 settings.json 里的 imagePath 和已注入的 CSS。
-        try { await commands.executeCommand('wallpaperStudio.runAction', 7); } catch { /* 忽略 */ }
 
         onDidChangeGlobalState.fire();
         this.pushState();
+        } finally { this.resetting = false; }
     }
 
     /** 当前实际生效的来源模式；模式选择本身不应被配置文件可用性覆盖。 */
     private currentSourceMode(): 'file' | 'folder' | 'wallpaper' {
         return normalizeSourceMode(this.sourceMode);
-    }
-
-    /** 某个路径属于哪种来源：壁纸播放列表 / 目录媒体 / 本地文件。 */
-    private modeOfPath(candidate: string): 'file' | 'folder' | 'wallpaper' {
-        if (!candidate) { return this.currentSourceMode(); }
-        const key = this.normalizePath(candidate);
-        if (this.wallpaperEntries.some(entry => this.normalizePath(entry.path) === key)) {
-            return 'wallpaper';
-        }
-        const folder = expandPathVariables(
-            getAppConfig().get<string>('randomImageFolder') || ''
-        );
-        if (folder && this.isPathInFolder(candidate, folder)) { return 'folder'; }
-        return 'file';
-    }
-
-    /** 来源标签仅用于提示；候选成员资格统一由 sourceMode 提供。 */
-    private modeLabel(mode: 'file' | 'folder' | 'wallpaper'): string {
-        switch (mode) {
-            case 'wallpaper': return 'Wallpaper 配置';
-            case 'folder': return '目录媒体';
-            default: return '本地文件';
-        }
     }
 
     /** 面板右下角的轻量提示（避免用系统弹窗打断操作）。 */
@@ -1153,7 +1148,7 @@ export class StudioViewProvider implements WebviewViewProvider {
             const user = active?.user || '';
             const removed = readRemovedWallpapers(this.ctx.globalState);
             // 换用户等于换整个播放列表，项目元数据缓存也得一起丢。
-            if (active && active.user !== this.wallpaperUser) { force = true; }
+            if (active && this.wallpaperUser && active.user !== this.wallpaperUser) { force = true; }
             if (force) {
                 clearWallpaperProjectCache();
                 forgetWallpaperPlaylist();
@@ -1171,7 +1166,8 @@ export class StudioViewProvider implements WebviewViewProvider {
                         // 每项都上报；pushWallpaperLoadingProgress 内部按帧合并。
                         // 第一项（loaded=0）用来第一时间把总数告诉面板。
                         this.pushWallpaperLoadingProgress(loaded === 0);
-                    }
+                    },
+                    force
                 )
                 : [];
             if (!isCurrent()) { return false; }
@@ -1217,7 +1213,7 @@ export class StudioViewProvider implements WebviewViewProvider {
 
     /**
      * 把场景预览页（WebWallGL + 场景脚本）的 webview URI 交给面板，面板用它当 iframe 源。
-     * 页面写在 globalStorage 下，已属于允许根，无需额外申请。
+     * 页面写在统一用户缓存目录，发送前注册为 webview 允许根。
      */
     private async sendScenePreviewPage(): Promise<void> {
         const webview = this.view?.webview;
@@ -1225,7 +1221,7 @@ export class StudioViewProvider implements WebviewViewProvider {
         try {
             const { filePath, regenerated } = await ensureWallpaperScenePreviewPage(
                 this.ctx.extensionPath,
-                this.ctx.globalStorageUri.fsPath
+                CACHE_ROOT
             );
             this.ensureRootForFile(filePath);
             webview.postMessage({
@@ -1260,11 +1256,8 @@ export class StudioViewProvider implements WebviewViewProvider {
             if (!fs.existsSync(local)) { return ''; }
             this.ensureRootForFile(local);
             const uri = this.view!.webview.asWebviewUri(Uri.file(local)).toString();
-            if (isWallpaperPkgPath(local)) {
-                const stat = fs.statSync(local);
-                return `${uri}?v=${stat.mtimeMs}-${stat.size}`;
-            }
-            return uri;
+            const stat = fs.statSync(local);
+            return `${uri}?v=${stat.mtimeMs}-${stat.size}-${stat.ctimeMs}`;
         } catch {
             return '';
         }
@@ -1283,6 +1276,13 @@ export class StudioViewProvider implements WebviewViewProvider {
         add(Uri.joinPath(this.ctx.extensionUri, 'resources').fsPath);
         add(this.ctx.globalStorageUri?.fsPath);
         add(this.ctx.storageUri?.fsPath);
+        add(CACHE_ROOT);
+        const current = resolveCurrentImagePath(getAppConfig().get<string>('imagePath') || '');
+        if (current) { add(path.dirname(current)); }
+        add(expandPathVariables(getAppConfig().get<string>('randomImageFolder') || ''));
+        for (const file of getLocalFiles()) { add(path.dirname(file)); }
+        for (const directory of readWallpaperResourceDirectories(this.wallpaperConfigPath,
+            this.ctx.globalState.get<string>(WALLPAPER_USER_KEY, ''))) { add(directory); }
         (workspace.workspaceFolders || []).forEach(f => add(f.uri.fsPath));
     }
 
@@ -1291,11 +1291,16 @@ export class StudioViewProvider implements WebviewViewProvider {
         const dir = path.normalize(path.dirname(filePath));
         if (!dir || this.isCovered(dir)) { return; }
         this.allowedRoots.add(dir);
-        if (this.view) {
-            this.view.webview.options = {
-                enableScripts: true,
-                localResourceRoots: this.computeRootUris()
-            };
+        if (this.view && !this.rootsUpdatePending) {
+            this.rootsUpdatePending = true;
+            const view = this.view;
+            // Explicitly importing new locations may require one permissions update.
+            // Never reload once per file while constructing a gallery snapshot.
+            void Promise.resolve().then(() => {
+                this.rootsUpdatePending = false;
+                if (this.view !== view) { return; }
+                view.webview.options = { enableScripts: true, localResourceRoots: this.computeRootUris() };
+            });
         }
     }
 
@@ -1350,7 +1355,7 @@ export class StudioViewProvider implements WebviewViewProvider {
 
         // Always use our own CSP so the nonce below matches; drop any CSP shipped in the build.
         html = html.replace(/<meta[^>]+http-equiv=["']Content-Security-Policy["'][^>]*>/gi, '');
-        html = html.replace(/<head[^>]*>/i, m => `${m}\n<meta http-equiv="Content-Security-Policy" content="${csp}">`);
+        html = html.replace(/<head[^>]*>/i, m => `${m}\n<meta http-equiv="Content-Security-Policy" content="${csp}">\n<meta name="wallpaper-studio-source-mode" content="${this.currentSourceMode()}">\n<meta name="wallpaper-studio-view-session" content="${nonce}">`);
 
         // Stamp nonce on every inline/external script.
         // The lookahead requires a real tag start (`<script>` / `<script ...` / `<script/`):

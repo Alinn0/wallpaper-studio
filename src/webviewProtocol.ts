@@ -33,20 +33,22 @@ export type WebviewMessage =
     | { type: 'loadGallery' }
     | { type: 'runAction'; action: number; path?: string }
     | { type: 'setConfig'; key: string; value: unknown }
+    | { type: 'saveDisplayFps'; maxFps: number; overwrite: boolean }
     | { type: 'setGlobalState'; key: string; value: unknown }
     | { type: 'setSourceMode'; mode: 'file' | 'folder' | 'wallpaper' }
-    | { type: 'clearRecentImages' }
     | { type: 'selectWallpaperConfig' }
     | { type: 'reloadWallpaperConfig' }
     | { type: 'randomWallpaper' }
     | { type: 'previousWallpaper' }
     | { type: 'useWallpaper'; path: string }
+    | { type: 'setWallpaperPinned'; path: string; pinned: boolean }
     | { type: 'removeWallpaper'; path: string }
     | { type: 'removePlaylistItem'; path: string; mode: 'file' | 'folder' | 'wallpaper' }
     | { type: 'revealInExplorer'; path: string }
     | { type: 'setWallpaperProperty'; path: string; key: string; value: unknown }
     | { type: 'setWallpaperProperties'; path: string; properties: Record<string, unknown> }
     | { type: 'cacheThumbnail'; key: string; value: string }
+    | { type: 'readThumbnails'; keys: string[]; requestId: number }
     | { type: 'scenePreviewPage' }
     | { type: 'openExternal'; url: string }
     | { type: 'resetAll' };

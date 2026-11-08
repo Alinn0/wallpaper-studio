@@ -2,6 +2,8 @@ import * as crypto from 'crypto';
 import * as fs from 'fs';
 import * as path from 'path';
 import { atomicWriteTextSync } from './atomicWrite';
+import { SCENE_CACHE_DIR } from './cachePaths';
+import { acquireFileLock, checkCancellation, copyFileCancellable } from './cancellation';
 
 const WEBWALLGL_PLACEHOLDER = '__WALLPAPER_STUDIO_WEBWALLGL_BASE64__';
 const SCENE_PLACEHOLDER = '__WALLPAPER_STUDIO_SCENE_BASE64__';
@@ -49,10 +51,14 @@ export function patchWallpaperSceneRuntime(runtime: string): string {
     return runtime.slice(0, index) + method + runtime.slice(index);
 }
 
-function hashFile(filePath: string): Promise<string> {
+function hashFile(filePath: string, signal?: AbortSignal): Promise<string> {
+    checkCancellation(signal);
     return new Promise((resolve, reject) => {
         const hash = crypto.createHash('sha256');
         const stream = fs.createReadStream(filePath);
+        const abort = () => stream.destroy(new Error('Scene preparation cancelled'));
+        signal?.addEventListener('abort', abort, { once: true });
+        stream.once('close', () => signal?.removeEventListener('abort', abort));
         stream.on('data', (chunk: Buffer) => hash.update(chunk));
         stream.on('error', reject);
         stream.on('end', () => resolve(hash.digest('hex')));
@@ -80,61 +86,102 @@ export function buildWallpaperSceneHtml(template: string, webwallglRuntime: stri
     );
 }
 
-const packageHashes = new Map<string, { signature: string; hash: Promise<string> }>();
+interface PackageRecord { source: string; signature: string; hash: string; size: number; usedAt: number; }
+const PACKAGE_NAME = /^wallpaper-scene-[a-f0-9]{64}\.pkg$/;
+export const MAX_SCENE_PACKAGES = 5;
 
 export async function copyWallpaperScenePackage(
     sourcePath: string,
-    assetDirectory: string,
-    indexDirectory = path.join(assetDirectory, '.sources')
+    assetDirectory = SCENE_CACHE_DIR,
+    signal?: AbortSignal
 ): Promise<string> {
-    const stat = await fs.promises.stat(sourcePath);
-    const signature = `${stat.size}:${stat.mtimeMs}:${stat.ctimeMs}`;
-    const key = path.resolve(sourcePath);
-    const indexPath = path.join(indexDirectory, crypto.createHash('sha256').update(key).digest('hex') + '.json');
-    let writeIndex = false;
-    let cached = packageHashes.get(key);
-    if (!cached || cached.signature !== signature) {
-        let persistedHash = '';
-        try {
-            const record = JSON.parse(await fs.promises.readFile(indexPath, 'utf8'));
-            if (record.signature === signature && /^[a-f0-9]{64}$/.test(record.hash)) { persistedHash = record.hash; }
-        } catch { /* Cold source or invalid cache: hash the package once. */ }
-        writeIndex = !persistedHash;
-        cached = { signature, hash: persistedHash ? Promise.resolve(persistedHash) : hashFile(sourcePath) };
-        if (packageHashes.size >= 64) { packageHashes.delete(packageHashes.keys().next().value as string); }
-        packageHashes.set(key, cached);
-    }
-    let hash: string;
-    try { hash = await cached.hash; } catch (error) {
-        packageHashes.delete(key);
-        throw error;
-    }
+    return useWallpaperScenePackage(sourcePath, assetDirectory, file => Promise.resolve(file), signal);
+}
+
+/** Hold the cross-process cache lock until bytes have been read, even on Windows. */
+export async function readWallpaperScenePackage(sourcePath: string, signal?: AbortSignal): Promise<Buffer> {
+    return useWallpaperScenePackage(sourcePath, SCENE_CACHE_DIR, file => fs.promises.readFile(file, { signal }), signal);
+}
+
+async function useWallpaperScenePackage<T>(sourcePath: string, assetDirectory: string, use: (file: string) => Promise<T>, signal?: AbortSignal): Promise<T> {
+    checkCancellation(signal);
     await fs.promises.mkdir(assetDirectory, { recursive: true });
-    const assetPath = path.join(assetDirectory, `wallpaper-scene-${hash}.pkg`);
+    const release = await acquireFileLock(assetDirectory, signal);
+    let unpublishedAsset: string | undefined;
     try {
-        if ((await fs.promises.stat(assetPath)).size === stat.size) {
-            if (writeIndex) {
-                try { atomicWriteTextSync(indexPath, JSON.stringify({ signature, hash })); } catch { /* Cache metadata is optional. */ }
+        const indexPath = path.join(assetDirectory, 'index.json');
+        let records: PackageRecord[] = [];
+        try {
+            const parsed = JSON.parse(await fs.promises.readFile(indexPath, 'utf8'));
+            if (Array.isArray(parsed)) {
+                records = parsed.filter(r => r && /^[a-f0-9]{64}$/.test(r.hash) &&
+                    typeof r.source === 'string' && typeof r.signature === 'string' &&
+                    Number.isFinite(r.size) && Number.isFinite(r.usedAt));
             }
-            return assetPath;
+        } catch { /* A missing/corrupt cache index is rebuilt from originals. */ }
+        const source = path.resolve(sourcePath);
+        const stat = await fs.promises.stat(source);
+        const signatureOf = (s: fs.Stats) => `${s.size}:${s.mtimeMs}:${s.ctimeMs}`;
+        const signature = signatureOf(stat);
+        const previous = records.find(r => r.source === source && r.signature === signature);
+        const hash = previous?.hash || await hashFile(source, signal);
+        const assetPath = path.join(assetDirectory, `wallpaper-scene-${hash}.pkg`);
+        let valid = false;
+        try { valid = (await fs.promises.stat(assetPath)).size === stat.size; } catch { /* Recreate evicted cache. */ }
+        if (!valid) {
+            const temporary = `${assetPath}.${process.pid}.${crypto.randomBytes(6).toString('hex')}.tmp`;
+            try {
+                await copyFileCancellable(source, temporary, signal);
+                if (signatureOf(await fs.promises.stat(source)) !== signature || await hashFile(temporary, signal) !== hash) {
+                    throw new Error('Scene package changed while preparing it; retry the wallpaper.');
+                }
+                await fs.promises.rename(temporary, assetPath);
+                unpublishedAsset = assetPath;
+            } finally { await fs.promises.unlink(temporary).catch(() => undefined); }
         }
-    } catch (error) {
-        if ((error as NodeJS.ErrnoException).code !== 'ENOENT') { throw error; }
-    }
-    const temporary = `${assetPath}.${process.pid}.${crypto.randomBytes(6).toString('hex')}.tmp`;
-    try {
-        await fs.promises.copyFile(sourcePath, temporary);
-        const after = await fs.promises.stat(sourcePath);
-        if (`${after.size}:${after.mtimeMs}:${after.ctimeMs}` !== signature) {
-            packageHashes.delete(key);
-            throw new Error('Scene package changed while preparing it; retry the wallpaper.');
+        checkCancellation(signal);
+        const usedAt = Math.max(Date.now(), ...records.map(r => r.usedAt + 1));
+        records = [{ source, signature, hash, size: stat.size, usedAt },
+            ...records.filter(r => r.hash !== hash).sort((a, b) => b.usedAt - a.usedAt)].slice(0, MAX_SCENE_PACKAGES);
+        atomicWriteTextSync(indexPath, JSON.stringify(records));
+        unpublishedAsset = undefined;
+        const keep = new Set(records.map(r => `wallpaper-scene-${r.hash}.pkg`));
+        for (const name of await fs.promises.readdir(assetDirectory)) {
+            // Never remove source files or unrelated files, including in a custom directory.
+            if ((PACKAGE_NAME.test(name) && !keep.has(name)) || /^wallpaper-scene-[a-f0-9]{64}\.pkg\..+\.tmp$/.test(name) ||
+                /^index\.json\..+\.tmp$/.test(name)) {
+                await fs.promises.unlink(path.join(assetDirectory, name));
+            }
         }
-        await fs.promises.rename(temporary, assetPath);
-        try { atomicWriteTextSync(indexPath, JSON.stringify({ signature, hash })); } catch { /* Live asset is still usable. */ }
+        const legacyIndexes = path.join(assetDirectory, '.sources');
+        try {
+            for (const name of await fs.promises.readdir(legacyIndexes)) {
+                if (/^[a-f0-9]{64}\.json(?:\..+\.tmp)?$/.test(name)) {
+                    await fs.promises.unlink(path.join(legacyIndexes, name));
+                }
+            }
+            await fs.promises.rmdir(legacyIndexes);
+        } catch (error) {
+            if (!['ENOENT', 'ENOTEMPTY'].includes((error as NodeJS.ErrnoException).code || '')) { throw error; }
+        }
+        checkCancellation(signal);
+        return await use(assetPath);
     } finally {
-        await fs.promises.unlink(temporary).catch(() => undefined);
+        try { if (unpublishedAsset) { await fs.promises.unlink(unpublishedAsset); } }
+        finally { await release(); }
     }
-    return assetPath;
+}
+
+export async function clearWallpaperSceneCache(): Promise<void> {
+    await fs.promises.mkdir(SCENE_CACHE_DIR, { recursive: true });
+    const release = await acquireFileLock(SCENE_CACHE_DIR);
+    try {
+        for (const name of await fs.promises.readdir(SCENE_CACHE_DIR)) {
+            if (PACKAGE_NAME.test(name) || name === 'index.json' || /^(?:index\.json|wallpaper-scene-[a-f0-9]{64}\.pkg)\..+\.tmp$/.test(name)) {
+                await fs.promises.unlink(path.join(SCENE_CACHE_DIR, name));
+            }
+        }
+    } finally { await release(); }
 }
 
 export interface WallpaperSceneInputs {

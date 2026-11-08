@@ -1,6 +1,6 @@
 import { reactive } from 'vue';
 import { useBridge } from './useBridge';
-import { getThumbnail, setThumbnail } from './useThumbnailCache';
+import { getThumbnail, setThumbnail, removeThumbnail, ensureThumbnails, thumbnailCacheStats } from './useThumbnailCache';
 import type { SceneRenderConfig } from '../../../src/sceneRender';
 
 /**
@@ -8,7 +8,7 @@ import type { SceneRenderConfig } from '../../../src/sceneRender';
  *
  * 面板里没法直接渲染场景：`.pkg` 要靠 WebWallGL 跑真渲染，而那份运行时是 1.1 MB，
  * 塞进本来就不小的 webview bundle 不划算。所以复用扩展已经准备好的那份场景页
- * （`globalStorage/scene-preview/wallpaper-studio-scene.html`，由 StudioViewProvider
+ * （`.wallpaper-studio/scene-preview/wallpaper-studio-scene.html`，由 StudioViewProvider
  * 提供 webview URI），用一个离屏 iframe 当渲染器：
  *
  *   面板 fetch(pkg) → postMessage(bytes, capture:true) → iframe 渲染并回传首帧
@@ -39,7 +39,6 @@ const PAGE_URI_RETRY_MS = 2000;
 const PAGE_URI_MAX_REQUESTS = 6;
 
 /** pkg 的 webview URI → 首帧 dataURL */
-const cache = reactive<Record<string, string>>({});
 /** pkg 的 webview URI → 正在渲染（驱动 UI 显示加载态） */
 const rendering = reactive<Record<string, boolean>>({});
 /** pkg 的 webview URI → 最近一次失败原因（透传到 UI，出问题时有据可查） */
@@ -61,6 +60,7 @@ interface PreviewJob {
 const queue: PreviewJob[] = [];
 let queueRunning = false;
 let activeJob: PreviewJob | null = null;
+let priorityEpoch = 0;
 let frameGeneration = 0;
 
 let pageUri = '';
@@ -229,9 +229,9 @@ function finish(dataUrl: string | null) {
  */
 const SCENE_SCRIPT_MARKER = 'data-wallpaper-studio-scene';
 
-async function loadPageHtml(uri: string): Promise<string> {
+async function loadPageHtml(uri: string, signal: AbortSignal): Promise<string> {
     if (pageHtml) { return pageHtml; }
-    const response = await fetch(uri);
+    const response = await fetch(uri, { signal });
     if (!response.ok) {
         throw new Error(`读取场景预览页失败（HTTP ${response.status}）`);
     }
@@ -249,7 +249,7 @@ async function ensureFrame(signal: AbortSignal): Promise<HTMLIFrameElement | nul
     if (frame) { return frame; }
     let html = '';
     try {
-        html = await loadPageHtml(uri);
+        html = await loadPageHtml(uri, signal);
     } catch (error) {
         pageError = error instanceof Error ? error.message : String(error);
         return null;
@@ -302,6 +302,9 @@ async function renderOnce(
     job: PreviewJob
 ): Promise<RenderOutcome> {
     const { key, properties, project } = job;
+    const cached = lookup(key, properties);
+    if (cached.exact || (!job.priority && cached.base)) { return { dataUrl: cached.exact || cached.base, error: '' }; }
+    thumbnailCacheStats.sceneRenders++;
     currentError = '';
     // 先握手再投递：渲染器没就绪就 postMessage，等于把字节丢进一个还没挂监听器的
     // 窗口，等再久也等不到首帧。握手失败直接重建 iframe，让下一次尝试干净重来。
@@ -387,8 +390,11 @@ function runQueue() {
                 const job = queue.shift()!;
                 if (job.cancelled) { continue; }
                 activeJob = job;
-                job.resolve(await renderOnce(job).catch(error => ({ dataUrl: null,
-                    error: job.cancelled ? '' : error instanceof Error ? error.message : String(error) })));
+                const deadline = window.setTimeout(() => job.controller.abort(), PAGE_READY_TIMEOUT_MS + FRAME_TIMEOUT_MS);
+                try {
+                    job.resolve(await renderOnce(job).catch(error => ({ dataUrl: null,
+                        error: job.cancelled ? '' : error instanceof Error ? error.message : String(error) })));
+                } finally { window.clearTimeout(deadline); }
                 if (activeJob === job) { activeJob = null; }
             }
         } finally {
@@ -425,14 +431,12 @@ function propertiesKey(properties?: Record<string, unknown>): string {
  */
 function lookup(key: string, properties?: Record<string, unknown>): { exact: string; base: string } {
     const cacheKey = key + propertiesKey(properties);
-    const exact = cache[cacheKey] || getThumbnail(`scene:${cacheKey}`);
-    if (exact) { cache[cacheKey] = exact; }
-    const base = cache[key] || getThumbnail(`scene:${key}`);
-    if (base) { cache[key] = base; }
+    const exact = getThumbnail(`scene:${cacheKey}`);
+    const base = getThumbnail(`scene:${key}`);
     return { exact, base };
 }
 
-function requestPreview(
+async function requestPreview(
     key: string,
     priority = false,
     renderConfig?: Pick<SceneRenderConfig, 'properties' | 'project'>
@@ -441,6 +445,9 @@ function requestPreview(
     const properties = renderConfig?.properties;
     const project = renderConfig?.project;
     const cacheKey = key + propertiesKey(properties);
+    const epoch = priority ? ++priorityEpoch : 0;
+    await ensureThumbnails([`scene:${cacheKey}`, `scene:${key}`]);
+    if (priority && epoch !== priorityEpoch) { return null; }
     if (priority) { cancelJobs(job => job.cacheKey !== cacheKey && (job.priority || job === activeJob)); }
     const { exact, base } = lookup(key, properties);
     if (exact) { return Promise.resolve(exact); }
@@ -473,6 +480,10 @@ function enqueue(
     const task = new Promise<RenderOutcome>(resolve => {
         rendering[cacheKey] = true;
         attempts.set(cacheKey, (attempts.get(cacheKey) ?? 0) + 1);
+        while (attempts.size > 300) {
+            const oldest = attempts.keys().next().value as string;
+            attempts.delete(oldest); delete errors[oldest]; delete rendering[oldest];
+        }
         job = { key, cacheKey, priority, controller: new AbortController(), cancelled: false,
             properties: toCloneable(properties), project: toCloneable(project), resolve };
         if (priority) {
@@ -484,11 +495,9 @@ function enqueue(
     }).then(({ dataUrl, error }) => {
         if (job.cancelled) { return null; }
         if (dataUrl) {
-            cache[cacheKey] = dataUrl;
             setThumbnail(`scene:${cacheKey}`, dataUrl);
             // 第一次渲染成功时顺便记一份基线，供列表/下次打开直接复用。
-            if (!cache[key]) {
-                cache[key] = dataUrl;
+            if (!getThumbnail(`scene:${key}`)) {
                 setThumbnail(`scene:${key}`, dataUrl);
             }
             delete errors[cacheKey];
@@ -544,6 +553,9 @@ if (typeof document !== 'undefined') {
 
 export function useScenePreview() {
     return {
+        cacheKeys(key: string, properties?: Record<string, unknown>): string[] {
+            return key ? [`scene:${key + propertiesKey(properties)}`, `scene:${key}`] : [];
+        },
         /** 已渲染好的首帧；未渲染返回空串。精确键未命中时退回该包的基线帧。 */
         previewOf(key: string, properties?: Record<string, unknown>): string {
             if (!key) { return ''; }
@@ -563,13 +575,13 @@ export function useScenePreview() {
          * 渲染失败返回 null（同一个包最多尝试 MAX_ATTEMPTS 次）。
          */
         requestPreview,
-        cancelPriority() { cancelJobs(job => job.priority); },
+        cancelPriority() { priorityEpoch++; cancelJobs(job => job.priority); },
         cancelQueuedExcept(keys: Set<string>) { cancelJobs(job => !job.priority && !keys.has(job.key)); },
         /** 丢弃缓存（例如用户重新选择了同名文件）。 */
         invalidate(key?: string) {
-            const keys = key ? [key] : Object.keys(cache);
+            const keys = key ? [key, ...[...attempts.keys()].filter(k => k.startsWith(key + '#'))] : [...attempts.keys()];
             keys.forEach(k => {
-                delete cache[k];
+                removeThumbnail(`scene:${k}`);
                 delete errors[k];
                 attempts.delete(k);
             });
@@ -580,9 +592,9 @@ export function useScenePreview() {
 
 /** webview 卸载时清掉模块级单例，避免残留旧 iframe 和缓存。 */
 export function disposeScenePreviewRuntime() {
+    priorityEpoch++;
     cancelJobs(() => true);
     releaseFrame();
-    Object.keys(cache).forEach(k => delete cache[k]);
     Object.keys(errors).forEach(k => delete errors[k]);
     attempts.clear();
     pageHtml = '';

@@ -15,16 +15,19 @@ import {
 } from 'vscode';
 
 import { FileDom, getActiveWindowCssFile, hasCachedBackgroundCss, patchBackgroundAppearanceInCss, patchScenePropertiesInCss } from './FileDom';
-import { BackgroundPatchError, BackgroundApplyCancelledError, shouldTryNextAutoImage, pickUnusedCandidate } from './downloadError';
 import { ImgItem } from './ImgItem';
 import vsHelp from './vsHelp';
 import { getContext } from './global';
-import { getWorkspaceKey, hasCurrentImageRecord, resolveCurrentBlur, resolveCurrentImagePath, resolveCurrentOpacity, setCurrentBlur, setCurrentImagePath, setCurrentOpacity } from './windowBackground';
-import { getCandidatesForMode, getRandomCandidates, getSourceMode, setSourceMode } from './sourceMode';
+import { getWorkspaceKey, hasCurrentImageRecord, resolveCurrentBlur, resolveCurrentImagePath, resolveCurrentOpacity, setCurrentBlur, setCurrentImagePath, setCurrentOpacity, getPinnedImagePath, clearPinnedImagePath, setStagedImagePath } from './windowBackground';
+import { getCandidatesForMode, getRandomCandidates, getSourceMode, setSourceMode, addLocalFiles } from './sourceMode';
 import { expandPathVariables, isSupportedMedia, pickRandomFromFolder } from './pathUtil';
-import { getAppConfig } from './settingsStore';
+import { getAppConfig, SETTINGS_DIR } from './settingsStore';
 import { ActionType } from './webviewProtocol';
 import { normalizeComparablePath } from './pathComparison';
+import { beginBackgroundSelection, cancelBackgroundSelection, getPendingBackgroundSelection } from './backgroundSelection';
+import { recordWallpaperChange, withRotationLease } from './workspaceCoordination';
+import { getLibraryError } from './libraryHealth';
+import { claimDisplayRequest, DisplayRequest, pendingDisplayRequest } from './displayRequests';
 
 
 export { ActionType };
@@ -60,6 +63,12 @@ export class PickList {
     private static _reloadTriggerSeq: number = 0;
     private static _updateSeq: number = 0;
     private static activeUpdates = 0;
+    private static activeSelections = 0;
+    private static autoGeneration = 0;
+    private static deferredAppearance = false;
+    private static rotationScope(): string {
+        return getAppConfig().get('perWindowBackground', true) ? (getWorkspaceKey() || 'no-workspace') : 'shared';
+    }
 
     private readonly quickPick: QuickPick<ImgItem> | any;
     private _disposables: Disposable[] = [];
@@ -71,10 +80,18 @@ export class PickList {
     private blur: number;
     private randUpdate: boolean = false;
     private silentApply: boolean = false;
+    private pinOnApply = false;
+    private isCurrentRequest: () => boolean = () => true;
+    private selectionSignal?: AbortSignal;
+    private preparedDom?: FileDom;
+    private displayRequest?: DisplayRequest;
+    private automaticSelection = false;
 
     // --- Static Entry Points ---
 
     public static needAutoUpdate(config: WorkspaceConfiguration) {
+        if (PickList.activeSelections > 0 || PickList.activeUpdates > 0) { PickList.deferredAppearance = true; return; }
+        if (pendingDisplayRequest(PickList.rotationScope())) { PickList.deferredAppearance = true; return; }
         if (!resolveCurrentImagePath(config.imagePath || '')) { return; }
 
         PickList.itemList = new PickList(config);
@@ -101,11 +118,15 @@ export class PickList {
      */
     public static async applyBackgroundPath(
         imagePath: string,
-        options: { persist?: boolean; silent?: boolean } = {}
+        options: { persist?: boolean; silent?: boolean; pin?: boolean; isCurrent?: () => boolean; automatic?: boolean } = {}
     ): Promise<boolean> {
         const config = getAppConfig();
         const item = new PickList(config);
         item.silentApply = options.silent === true;
+        item.pinOnApply = options.pin === true;
+        item.automaticSelection = options.automatic === true;
+        item.isCurrentRequest = options.isCurrent || (() => true);
+        if (!item.isCurrentRequest()) { return false; }
         try {
             return Boolean(await item.updateBackgound(
                 imagePath,
@@ -131,13 +152,35 @@ export class PickList {
      * "随机会随机到别的模式的壁纸"。
      */
     public static async autoUpdateBackground(): Promise<boolean> {
-        return PickList.randomForCurrentMode();
+        return PickList.randomForCurrentMode(new Set(), () => !getPinnedImagePath());
+    }
+
+    public static async setWallpaperPinned(imagePath: string, pinned: boolean): Promise<boolean> {
+        if (pinned) { return PickList.applyBackgroundPath(imagePath, { pin: true }); }
+        const currentPin = getPinnedImagePath();
+        if (!currentPin || normalizeComparablePath(currentPin) !== normalizeComparablePath(imagePath)) { return false; }
+        const sequence = ++PickList._updateSeq;
+        const workspaceKey = getWorkspaceKey();
+        await clearPinnedImagePath(currentPin, () => sequence === PickList._updateSeq && workspaceKey === getWorkspaceKey());
+        if (sequence !== PickList._updateSeq || workspaceKey !== getWorkspaceKey()) { return false; }
+        PickList.startAutoRandomTask();
+        return true;
+    }
+
+    /** Leaving a pin by an ordinary selection explicitly enables rotation. */
+    private static async enableAutoRotation(): Promise<void> {
+        const config = getAppConfig();
+        const interval = config.get<number>('autoInterval', 0);
+        if (!Number.isFinite(interval) || interval <= 0) { await config.update('autoInterval', 60, ConfigurationTarget.Global); }
+        if (!config.get<boolean>('autoStatus', false)) { await config.update('autoStatus', true, ConfigurationTarget.Global); }
     }
 
     /** 在当前模式内随机换一张（启动初始化、定时器与手动随机共用）。 */
-    private static async randomForCurrentMode(tried: Set<string> = new Set()): Promise<boolean> {
+    private static async randomForCurrentMode(tried: Set<string> = new Set(), isCurrent: () => boolean = () => true, automatic = false): Promise<boolean> {
+        if (!isCurrent() || getLibraryError()) { return false; }
         const config = getAppConfig();
-        const current = resolveCurrentImagePath(config.get<string>('imagePath') || '');
+        const current = getPendingBackgroundSelection(getWorkspaceKey())
+            ?? resolveCurrentImagePath(config.get<string>('imagePath') || '');
         const candidates = getRandomCandidates(current).filter(candidate => !tried.has(normalizeComparablePath(candidate)));
         if (!candidates.length) { return false; }
         const next = candidates[Math.floor(Math.random() * candidates.length)];
@@ -145,7 +188,7 @@ export class PickList {
         // Startup initialization, automatic rotation, and the random command
         // all represent the current window's latest background. Persisting
         // through setCurrentImagePath records it per window/workspace.
-        const applied = await PickList.applyBackgroundPath(next, { persist: true, silent: true });
+        const applied = await PickList.applyBackgroundPath(next, { persist: true, silent: true, isCurrent, automatic });
         return applied;
     }
 
@@ -155,6 +198,7 @@ export class PickList {
      * must not be randomized here.
      */
     public static async initializeBackground(): Promise<boolean> {
+        if (getLibraryError()) { return false; }
         if (hasCurrentImageRecord()) { return false; }
         return PickList.randomForCurrentMode();
     }
@@ -186,6 +230,11 @@ export class PickList {
         setTimeout(() => triggerMsg.dispose(), 1000);
     }
 
+    public static async refreshWorkspaceDisplay(): Promise<void> {
+        if (PickList.activeSelections) { return; }
+        PickList.fireReloadTrigger('css', getActiveWindowCssFile().token);
+    }
+
     /**
      * 立即应用壁纸用户配置 / XY 视角，不重装背景。
      *
@@ -194,13 +243,21 @@ export class PickList {
      * 返回 false 表示当前背景不是场景包，调用方无需继续处理。
      */
     public static async applySceneProperties(properties: Record<string, unknown>): Promise<boolean> {
-        const patched = await patchScenePropertiesInCss(properties);
+        if (PickList.activeSelections || PickList.activeUpdates) { PickList.deferredAppearance = true; return true; }
+        if (pendingDisplayRequest(PickList.rotationScope())) { PickList.deferredAppearance = true; return true; }
+        const source = resolveCurrentImagePath();
+        const sequence = PickList._updateSeq;
+        const workspace = getWorkspaceKey();
+        const patched = await patchScenePropertiesInCss(properties, source, () =>
+            !PickList.activeSelections && !pendingDisplayRequest(PickList.rotationScope()) && sequence === PickList._updateSeq && workspace === getWorkspaceKey());
         if (!patched) { return false; }
         PickList.fireReloadTrigger('css', getActiveWindowCssFile().token);
         return true;
     }
 
     public static async applyCurrentBackground(forceReload: boolean = false): Promise<boolean> {
+        if (PickList.activeSelections > 0) { PickList.deferredAppearance = true; return false; }
+        if (pendingDisplayRequest(PickList.rotationScope())) { return false; }
         const config = getAppConfig();
         const resolved = resolveCurrentImagePath(config.get<string>('imagePath') || '');
 
@@ -241,6 +298,8 @@ export class PickList {
     }
 
     public static async applyCurrentAppearance(config: WorkspaceConfiguration): Promise<boolean> {
+        if (PickList.activeSelections) { PickList.deferredAppearance = true; return true; }
+        if (pendingDisplayRequest(PickList.rotationScope())) { PickList.deferredAppearance = true; return true; }
         if (PickList.activeUpdates || typeof patchBackgroundAppearanceInCss !== 'function') { return false; }
         const imagePath = resolveCurrentImagePath(config.imagePath || '');
         if (!imagePath) { return false; }
@@ -248,7 +307,7 @@ export class PickList {
         const workspaceKey = getWorkspaceKey();
         const applied = await patchBackgroundAppearanceInCss(imagePath,
             resolveCurrentOpacity(config.opacity), resolveCurrentBlur(config.blur),
-            () => sequence === PickList._updateSeq && workspaceKey === getWorkspaceKey());
+            () => !PickList.activeSelections && !pendingDisplayRequest(PickList.rotationScope()) && sequence === PickList._updateSeq && workspaceKey === getWorkspaceKey());
         if (applied) { PickList.fireReloadTrigger('css', getActiveWindowCssFile().token); }
         return applied;
     }
@@ -269,20 +328,32 @@ export class PickList {
         }
     }
 
+    public static resumeDeferredAppearance(): void {
+        if (!PickList.deferredAppearance || PickList.activeSelections || PickList.activeUpdates || pendingDisplayRequest(PickList.rotationScope())) { return; }
+        PickList.deferredAppearance = false;
+        PickList.needAutoUpdate(getAppConfig());
+    }
+
     public static startAutoRandomTask() {
         const config = getAppConfig();
         const autoStatus = config.get<boolean>('autoStatus');
         const interval = config.get<number>('autoInterval', 0);
 
         PickList.stopAutoRandomTask();
+        if (getLibraryError()) { return; }
 
-        if (autoStatus && interval > 0) {
+        if (autoStatus && Number.isFinite(interval) && interval > 0 && !getPinnedImagePath()) {
+            const generation = PickList.autoGeneration;
+            const isCurrent = () => generation === PickList.autoGeneration && !getPinnedImagePath();
             PickList.logAutoRefresh(`Timer started. Interval: ${interval}s.`);
             PickList.intervalHandle = setInterval(async () => {
-                if (PickList.isAutoRunning) {
+                if (!isCurrent()) { return; }
+                if (PickList.isAutoRunning || PickList.activeUpdates > 0 || PickList.activeSelections > 0) {
                     PickList.logAutoRefresh('Timer tick skipped: previous refresh is still running.');
                     return;
                 }
+                await withRotationLease(PickList.rotationScope(), interval, async () => {
+                if (!isCurrent() || getPinnedImagePath()) { return; }
                 // 定时轮播同样只在**当前来源模式**内抽候选，绝不跨模式。
                 // 旧实现按 wallpaperStudioWallpaperEnabled 分支，与真正生效的
                 // wallpaperStudioSourceMode 是两套判定，于是 Wallpaper 模式下
@@ -298,9 +369,9 @@ export class PickList {
                     try {
                         let applied = false;
                         const tried = new Set<string>();
-                        for (let attempt = 0; attempt < AUTO_IMAGE_ATTEMPTS && !applied; attempt++) {
+                        for (let attempt = 0; attempt < AUTO_IMAGE_ATTEMPTS && !applied && isCurrent(); attempt++) {
                             try {
-                                applied = await PickList.randomForCurrentMode(tried);
+                                applied = await PickList.randomForCurrentMode(tried, isCurrent, true);
                             } catch (error) {
                                 PickList.logAutoRefresh(`Candidate failed: ${String(error)}`);
                             }
@@ -317,6 +388,7 @@ export class PickList {
                     return;
                 }
 
+                }).catch(error => console.warn('[WallpaperStudio] Rotation lease skipped:', error));
             }, interval * 1000);
         }
     }
@@ -330,6 +402,7 @@ export class PickList {
     }
 
     public static stopAutoRandomTask() {
+        PickList.autoGeneration++;
         if (PickList.intervalHandle) {
             clearInterval(PickList.intervalHandle);
             PickList.intervalHandle = undefined;
@@ -387,7 +460,10 @@ export class PickList {
             case ActionType.UpdateBackground: await this.updateBackgound(path); break;
             case ActionType.BackgroundOpacity: this.showOpacitySlider(); break;
             case ActionType.InputPath: this.showInputBox(InputType.Path); break;
-            case ActionType.CloseBackground: await this.updateDom(true); break;
+            case ActionType.CloseBackground:
+                cancelBackgroundSelection();
+                await this.updateBackgound('');
+                break;
             case ActionType.ReloadWindow: commands.executeCommand('workbench.action.reloadWindow'); break;
             case ActionType.CloseMenu: this.quickPick.hide(); break;
             case ActionType.OpenExternalUrl: this.gotoPath(path); break;
@@ -413,78 +489,13 @@ export class PickList {
         }
     }
 
-    /**
-     * 目录轮播的旧入口（保留给内部调用）。
-     *
-     * 在线图源（URL 目录 / 单图在线地址）已移除，这里只处理本地目录。
-     * 定时器与"随机换一张"走的是 `sourceMode.getCandidatesForMode()`，
-     * 本方法只作为历史兼容入口存在。
-     */
-    private async autoUpdateBackground(persist: boolean = true): Promise<boolean> {
-        this.silentApply = !persist;
-        const randomImageFolderCfg = this.config.get<string>('randomImageFolder');
-        const randomImageFolder = this.resolveRandomFolder(randomImageFolderCfg);
-        if (randomImageFolder) {
-            const files = this.getFolderImgList(randomImageFolder).map(file => path.join(randomImageFolder, file));
-            if (files.length > 0) {
-                if (!persist) {
-                    return await this.applyAutoCandidates(files, persist);
-                }
-                const randomFile = files[Math.floor(Math.random() * files.length)];
-                await this.updateBackgound(randomFile, persist, { skipLargeImagePrompt: true });
-            }
-        }
-        return true;
-    }
-
-    private async applyAutoCandidates(candidates: string[], persist: boolean): Promise<boolean> {
-        const tried = new Set<string>();
-        for (let i = 0; i < AUTO_IMAGE_ATTEMPTS; i++) {
-            const next = pickUnusedCandidate(candidates, tried);
-            if (!next) {
-                break;
-            }
-            tried.add(next);
-            try {
-                await this.updateBackgound(next, persist, { skipLargeImagePrompt: true });
-                return true;
-            } catch (error) {
-                if (error instanceof BackgroundApplyCancelledError || error instanceof BackgroundPatchError) {
-                    return false;
-                }
-                console.error('[WallpaperStudio] Auto image update failed:', error);
-                if (!shouldTryNextAutoImage(error)) {
-                    return false;
-                }
-            }
-        }
-        window.setStatusBarMessage('自动换图失败，将在下个间隔再试 / Auto background update failed, will retry next interval.', 5000);
-        return false;
-    }
-
     /** 打开扩展的存储目录（缩略图缓存等都在这里）。在线图源已移除，不再有下载缓存。 */
     private openCacheFolder() {
-        const context = getContext();
-        const dir = context.globalStorageUri?.fsPath;
-        if (!dir) { return; }
+        const dir = SETTINGS_DIR;
         if (!fs.existsSync(dir)) {
             fs.mkdirSync(dir, { recursive: true });
         }
         void env.openExternal(Uri.file(dir));
-    }
-
-    /** Push a path to the front of the recent-used list, keeping at most 20. */
-    private async pushRecentImage(filePath: string): Promise<void> {
-        try {
-            if (!filePath) { return; }
-            const context = getContext();
-            const normalize = normalizeComparablePath;
-            const prev = context.globalState.get<string[]>('wallpaperStudioRecentImages', []) || [];
-            const next = [filePath, ...prev.filter((p) => normalize(p) !== normalize(filePath))].slice(0, 20);
-            await context.globalState.update('wallpaperStudioRecentImages', next);
-        } catch (e) {
-            console.warn('[WallpaperStudio] pushRecentImage failed:', e);
-        }
     }
 
     public static listFolderImages(pathUrl: string): string[] {
@@ -492,28 +503,6 @@ export class PickList {
         return fs.readdirSync(path.resolve(pathUrl), { withFileTypes: true })
             .filter(entry => entry.isFile() && isSupportedMedia(entry.name))
             .map(entry => entry.name);
-    }
-
-    private getFolderImgList(pathUrl: string): string[] {
-        return PickList.listFolderImages(pathUrl);
-    }
-
-    /**
-     * A3: 展开 randomImageFolder 中的 ~ / ${ENV} / $ENV 并校验是存在的目录；
-     * 无效返回空串。
-     */
-    private resolveRandomFolder(input?: string): string {
-        if (!input) { return ''; }
-        const expanded = expandPathVariables(input);
-        try {
-            const resolved = path.resolve(expanded);
-            if (fs.existsSync(resolved) && fs.statSync(resolved).isDirectory()) {
-                return resolved;
-            }
-        } catch {
-            // ignore
-        }
-        return '';
     }
 
     /**
@@ -727,6 +716,8 @@ export class PickList {
         }
 
         if (type === InputType.Path) {
+            await setSourceMode('file');
+            await addLocalFiles([value]);
             return this.updateBackgound(value, true);
         } else if (type === InputType.Opacity) {
             await this.setConfigValue('opacity', parseFloat(value), true);
@@ -742,7 +733,7 @@ export class PickList {
                 }
                 await this.setConfigValue('autoInterval', interval, false);
                 await this.setConfigValue('autoStatus', true, false);
-                await this.autoUpdateBackground();
+                await PickList.autoUpdateBackground();
             } else {
                 await this.setConfigValue('autoStatus', false, false);
                 await this.setConfigValue('autoInterval', 0, false);
@@ -764,11 +755,52 @@ export class PickList {
         persist: boolean = true,
         options: UpdateBackgroundOptions = {}
     ) {
-        if (path === undefined) { path = resolveCurrentImagePath(this.config.get<string>('imagePath') || ''); }
-        if (path === '') { return (await this.updateDom(true)).applied; }
-        const applied = await this.setConfigValue('imagePath', path, true, persist);
-        if (applied) { await this.pushRecentImage(path); }
-        return applied;
+        PickList.activeSelections++;
+        let selection: ReturnType<typeof beginBackgroundSelection> | undefined;
+        const originalGuard = this.isCurrentRequest;
+        try {
+            if (path === undefined) { path = resolveCurrentImagePath(this.config.get<string>('imagePath') || ''); }
+            if (!this.isCurrentRequest()) { return false; }
+            // Notify the panel before package validation, hashing, copying or patching.
+            // This does not write runtime.json or move the previous/pinned wallpaper.
+            selection = beginBackgroundSelection(path, getWorkspaceKey());
+            const currentSelection = selection;
+            this.displayRequest = await claimDisplayRequest(PickList.rotationScope(), path, currentSelection.signal, this.automaticSelection);
+            if (!this.displayRequest) { return false; }
+            this.selectionSignal = this.displayRequest.signal;
+            this.isCurrentRequest = () => originalGuard() && currentSelection.isCurrent() && !!this.displayRequest?.isCurrent();
+            if (path === '') {
+                const applied = (await this.updateDom(true)).applied;
+                if (applied) { PickList.startAutoRandomTask(); }
+                return applied;
+            }
+            const oldPin = getPinnedImagePath();
+            const applied = await this.setConfigValue('imagePath', path, true, persist);
+            if (applied) {
+                await recordWallpaperChange(PickList.rotationScope());
+                if (oldPin && !this.pinOnApply && normalizeComparablePath(oldPin) !== normalizeComparablePath(path)) {
+                    await PickList.enableAutoRotation();
+                }
+                // Start a fresh full interval only after the new background was applied and saved.
+                PickList.startAutoRandomTask();
+            }
+            return applied;
+        } catch (error) {
+            if (selection?.signal.aborted || this.displayRequest?.signal.aborted) { return false; }
+            throw error;
+        } finally {
+            try { await this.displayRequest?.finish(); }
+            finally {
+                this.displayRequest = undefined;
+                selection?.finish();
+                this.isCurrentRequest = originalGuard;
+                PickList.activeSelections--;
+                if (!PickList.activeSelections && PickList.deferredAppearance) {
+                    PickList.deferredAppearance = false;
+                    PickList.needAutoUpdate(getAppConfig());
+                }
+            }
+        }
     }
 
     private async openFieldDialog(type: number) {
@@ -794,9 +826,7 @@ export class PickList {
         if (type === 1) {
             await setSourceMode('file');
             const selectedPaths = folderUris.map(uri => uri.fsPath);
-            for (const selectedPath of selectedPaths) {
-                await this.pushRecentImage(selectedPath);
-            }
+            await addLocalFiles(selectedPaths);
             const selectedPath = selectedPaths[Math.floor(Math.random() * selectedPaths.length)];
             return this.updateBackgound(selectedPath, true);
         }
@@ -805,6 +835,7 @@ export class PickList {
 
     private async setConfigValue(name: string, value: any, updateDom: Boolean = true, persist: boolean = true) {
         if (name === 'imagePath') {
+            if (!this.isCurrentRequest()) { return false; }
             const nextPath = typeof value === 'string' ? value : '';
             const previousPath = this.imgPath;
             const workspaceKey = getWorkspaceKey();
@@ -816,6 +847,10 @@ export class PickList {
                 try {
                     const result = await this.updateDom();
                     if (!result.applied) {
+                        if (result.requiresReload) {
+                            await setStagedImagePath(nextPath, this.isCurrentRequest);
+                            window.setStatusBarMessage('壁纸已准备，重载窗口后确认渲染 / Wallpaper staged; reload the window to finish.', 10000);
+                        }
                         this.imgPath = previousPath;
                         return false;
                     }
@@ -825,12 +860,18 @@ export class PickList {
                 }
             }
             const sequence = PickList._updateSeq;
-            await setCurrentImagePath(nextPath, {
+            try { await setCurrentImagePath(nextPath, {
                 persist,
+                pin: this.pinOnApply ? true : undefined,
                 workspaceKey,
-                shouldPersist: () => sequence === PickList._updateSeq && workspaceKey === getWorkspaceKey()
-            });
-            return sequence === PickList._updateSeq && workspaceKey === getWorkspaceKey();
+                shouldPersist: () => sequence === PickList._updateSeq && workspaceKey === getWorkspaceKey() && this.isCurrentRequest()
+            }); } catch (error) {
+                if (this.preparedDom && await this.preparedDom.rollbackIfCurrent()) {
+                    PickList.fireReloadTrigger('css', this.preparedDom.windowCssToken);
+                }
+                throw error;
+            }
+            return sequence === PickList._updateSeq && workspaceKey === getWorkspaceKey() && this.isCurrentRequest();
         }
         if (persist) {
             if (name === 'opacity' || name === 'blur') {
@@ -868,8 +909,13 @@ export class PickList {
 
         const seq = ++PickList._updateSeq;
         const workspaceKey = getWorkspaceKey();
-        const isCurrentUpdate = () => seq === PickList._updateSeq && workspaceKey === getWorkspaceKey();
-        const dom = new FileDom(this.config, this.imgPath, this.opacity, this.sizeModel, this.blur, colorThemeKind, isCurrentUpdate, this.silentApply);
+        const isCurrentUpdate = () => {
+            const pending = pendingDisplayRequest(PickList.rotationScope());
+            return seq === PickList._updateSeq && workspaceKey === getWorkspaceKey() && this.isCurrentRequest()
+                && (!pending || pending.id === this.displayRequest?.id);
+        };
+        const dom = new FileDom(this.config, this.imgPath, this.opacity, this.sizeModel, this.blur, colorThemeKind, isCurrentUpdate, this.silentApply, this.selectionSignal);
+        this.preparedDom = dom;
         let result = false;
         let reloadTriggered = false;
         PickList.activeUpdates++;
@@ -919,6 +965,15 @@ export class PickList {
                         PickList.fireReloadTrigger(dom.didUpdateDynamicJs ? 'js' : 'css', dom.windowCssToken);
                     }
 
+                    if (!uninstall && typeof dom.waitUntilReady === 'function') {
+                        try { await dom.waitUntilReady(); }
+                        catch (error) {
+                            if (isCurrentUpdate()) { PickList.fireReloadTrigger('css', dom.windowCssToken); }
+                            throw error;
+                        }
+                        if (!isCurrentUpdate()) { return { applied: false, requiresReload: false }; }
+                    }
+
                     setTimeout(() => {
                         if (didChangeAssets) {
                             window.setStatusBarMessage('Background updated successfully! / 背景更新成功！', 5000);
@@ -955,13 +1010,21 @@ export class PickList {
             }
         } catch (error: any) {
             result = false;
+            // Superseded selections and closing the background are normal cancellation.
+            if (!isCurrentUpdate()) { return { applied: false, requiresReload: false }; }
             if (this.silentApply) {
                 throw error;
             }
             await window.showErrorMessage(`更新失败: ${error.message}`);
         } finally {
             PickList.activeUpdates--;
+            dom.cancelRenderConfirmation?.();
+            if (!PickList.activeUpdates && !PickList.activeSelections && PickList.deferredAppearance) {
+                PickList.deferredAppearance = false;
+                PickList.needAutoUpdate(getAppConfig());
+            }
         }
-        return { applied: result, requiresReload: result && dom.requiresReload };
+        if (dom.requiresReload) { dom.cancelRenderConfirmation?.(); }
+        return { applied: false, requiresReload: result && dom.requiresReload };
     }
 }

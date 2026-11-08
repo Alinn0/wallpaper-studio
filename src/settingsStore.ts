@@ -31,31 +31,31 @@ export interface AppSettings {
     randomImageFolder: string;
     autoStatus: boolean;
     autoInterval: number;
+    targetFps: number;
+    /** Shared display limit; 0 means it has not been measured yet. */
+    maxFps: number;
     sizeModel: string;
     blendModel: string;
-    forceHttpsUpgrade: boolean;
-    /** 内部标记：是否已经尝试过从旧版 settings.json 迁移。 */
-    seeded?: boolean;
 }
 
-/** 共享偏好的唯一默认值来源；性能调度与派生缓存不写入用户偏好。 */
+/** 共享偏好及用户要求持久复用的显示上限，统一由此定义默认值。 */
 export const DEFAULT_SETTINGS: AppSettings = {
-    // 透明度/模糊度默认 0：壁纸默认原样显示，需要柔化时再由用户在 UI 里调。
-    opacity: 0,
+    // 0 hides the wallpaper layer. Existing user values are preserved; fresh/reset defaults stay visible.
+    opacity: 0.2,
     blur: 0,
     imagePath: '',
     perWindowBackground: true,
     randomImageFolder: '',
     autoStatus: false,
     autoInterval: 0,
+    targetFps: 60,
+    maxFps: 0,
     sizeModel: 'cover',
-    blendModel: 'auto',
-    forceHttpsUpgrade: true,
-    seeded: false
+    blendModel: 'auto'
 };
 
-const NUMERIC_KEYS = new Set(['opacity', 'blur', 'autoInterval']);
-const BOOLEAN_KEYS = new Set(['perWindowBackground', 'autoStatus', 'forceHttpsUpgrade']);
+const NUMERIC_KEYS = new Set(['opacity', 'blur', 'autoInterval', 'targetFps', 'maxFps']);
+const BOOLEAN_KEYS = new Set(['perWindowBackground', 'autoStatus']);
 
 /**
  * 设置文件版本。
@@ -67,14 +67,14 @@ const BOOLEAN_KEYS = new Set(['perWindowBackground', 'autoStatus', 'forceHttpsUp
  *     （实测把用户的 `blendModel: "lighten"` 覆盖成了 `"multiply"`，
  *     而 multiply 叠在深色工作台上等于全黑 —— 表现就是"背景不显示"）。
  *
- * v3：透明度 / 模糊度改为 UI 独占（默认 0，不再从 VS Code settings.json 迁移），
+ * v3：壁纸可见度 / 模糊度改为 UI 独占（新安装默认 0.2 / 0，不再从 VS Code settings.json 迁移），
  * 并修复 v1/v2 遗留的这两个值。
  */
 const SETTINGS_VERSION = 3;
 
 /** 从旧 VS Code settings.json 迁移的键。透明度/模糊度由插件 UI 独占，不参与迁移。 */
 const SEEDABLE_KEYS = Object.keys(DEFAULT_SETTINGS).filter(
-    key => key !== 'seeded' && key !== 'version' && key !== 'opacity' && key !== 'blur'
+    key => key !== 'version' && key !== 'opacity' && key !== 'blur' && key !== 'maxFps'
 );
 
 let cache: AppSettings | null = null;
@@ -88,7 +88,8 @@ export const onDidChangeSettings: Event<string[]> = changeEmitter.event;
 function coerce<K extends keyof AppSettings>(key: K, value: unknown): AppSettings[K] | undefined {
     if (NUMERIC_KEYS.has(key as string)) {
         const num = typeof value === 'number' ? value : Number(value);
-        return (Number.isFinite(num) ? num : undefined) as AppSettings[K] | undefined;
+        if (key === 'maxFps') { return (Number.isFinite(num) && (num === 0 || num >= 15) ? Math.round(num) : undefined) as AppSettings[K] | undefined; }
+        return (Number.isFinite(num) ? (key === 'targetFps' ? Math.max(15, Math.round(num)) : num) : undefined) as AppSettings[K] | undefined;
     }
     if (BOOLEAN_KEYS.has(key as string)) {
         if (typeof value === 'boolean') { return value as AppSettings[K]; }
@@ -109,7 +110,7 @@ function coerce<K extends keyof AppSettings>(key: K, value: unknown): AppSetting
  *  - **先到先得**。主 `User/settings.json` 优先，profile 只补空缺；
  *    否则后遍历到的 profile 会把用户的真实设置覆盖掉。
  */
-function seedFromUserSettings(target: AppSettings): boolean {
+function seedFromUserSettings(target: AppSettings): void {
     const appData = process.env.APPDATA || '';
     const configRoot = process.env.XDG_CONFIG_HOME || path.join(os.homedir(), '.config');
     const products = ['Code', 'Code - Insiders', 'VSCodium', 'Cursor'];
@@ -153,7 +154,6 @@ function seedFromUserSettings(target: AppSettings): boolean {
             seeded.add(key);
         }
     }
-    return seeded.size > 0;
 }
 
 function load(): AppSettings {
@@ -167,11 +167,9 @@ function load(): AppSettings {
         const parsed = JSON.parse(raw);
         existed = true;
         for (const key of Object.keys(DEFAULT_SETTINGS)) {
-            if (key === 'seeded') { continue; }
             const coerced = coerce(key as keyof AppSettings, parsed?.[key]);
             if (coerced !== undefined) { (settings as any)[key] = coerced; }
         }
-        settings.seeded = parsed?.seeded === true;
         cachedVersion = Number(parsed?.version ?? 1);
         // v1 的迁移写入了错误的值（未反转义、跨 profile 覆盖），必须重新迁移一次。
         needsMigration = cachedVersion < SETTINGS_VERSION;
@@ -180,9 +178,7 @@ function load(): AppSettings {
     }
 
     if (!existed) {
-        if (seedFromUserSettings(settings)) {
-            settings.seeded = true;
-        }
+        seedFromUserSettings(settings);
         settings.version = SETTINGS_VERSION;
         cache = settings;
         return settings;
@@ -238,10 +234,10 @@ function persist(settings: AppSettings): boolean {
 /** 删除设置文件并回到全默认值（「清除所有缓存与配置」用）。 */
 export async function resetSettings(): Promise<void> {
     await withSettingsLock(() => {
-        const next = { ...DEFAULT_SETTINGS, seeded: true, version: SETTINGS_VERSION };
+        const next = { ...DEFAULT_SETTINGS, version: SETTINGS_VERSION };
         if (!persist(next)) { throw new Error('Failed to reset settings'); }
         cache = next;
-        changeEmitter.fire(Object.keys(DEFAULT_SETTINGS).filter(k => k !== 'seeded'));
+        changeEmitter.fire(Object.keys(DEFAULT_SETTINGS));
     });
 }
 
@@ -290,6 +286,24 @@ export function readSettings(): AppSettings {
     return { ...load() };
 }
 
+/** First valid measurement wins across hosts; an explicit re-read replaces it. */
+export async function saveDisplayFps(value: number, overwrite: boolean): Promise<boolean> {
+    if (!Number.isFinite(value) || value < 15) { throw new Error('Invalid display FPS'); }
+    return withSettingsLock(() => {
+        const previous = { ...load() };
+        if (fs.existsSync(SETTINGS_FILE)) { JSON.parse(fs.readFileSync(SETTINGS_FILE, 'utf8')); }
+        const settings = reloadFromDisk();
+        const next = { ...settings };
+        if (overwrite || !settings.maxFps) { next.maxFps = Math.round(value); }
+        next.targetFps = Math.min(next.targetFps, next.maxFps);
+        if (!persist(next)) { throw new Error('Failed to save display FPS'); }
+        cache = next;
+        const changed = Object.keys(DEFAULT_SETTINGS).filter(key => (previous as any)[key] !== (next as any)[key]);
+        if (changed.length) { changeEmitter.fire(changed); }
+        return changed.includes('maxFps') || changed.includes('targetFps');
+    });
+}
+
 /**
  * `WorkspaceConfiguration` 的鸭子类型替身。
  *
@@ -315,7 +329,7 @@ export class AppConfig {
          * 因此这里为每个设置键定义真实的 getter/setter。
          */
         for (const key of Object.keys(DEFAULT_SETTINGS)) {
-            if (key === 'seeded' || key === 'version') { continue; }
+            if (key === 'version') { continue; }
             Object.defineProperty(this, key, {
                 enumerable: true,
                 configurable: true,
@@ -349,7 +363,7 @@ export class AppConfig {
 
     async update(key: string, value: unknown, _target?: unknown, _overrideInLanguage?: boolean): Promise<void> {
         const name = (key.startsWith('wallpaperStudio.') ? key.slice('wallpaperStudio.'.length) : key) as keyof AppSettings;
-        if (!(name in DEFAULT_SETTINGS) || name === 'seeded') {
+        if (!(name in DEFAULT_SETTINGS)) {
             // 未知键：照旧吞掉，避免旧的调用路径抛错。
             return;
         }
@@ -361,7 +375,8 @@ export class AppConfig {
             if (fs.existsSync(SETTINGS_FILE)) { JSON.parse(fs.readFileSync(SETTINGS_FILE, 'utf8')); }
             const settings = reloadFromDisk();
             const next = { ...settings, [name]: coerced };
-            if ((settings as any)[name] !== coerced && !persist(next)) {
+            if (next.maxFps > 0) { next.targetFps = Math.min(next.targetFps, next.maxFps); }
+            if (JSON.stringify(settings) !== JSON.stringify(next) && !persist(next)) {
                 throw new Error(`Failed to save setting: ${name}`);
             }
             cache = next;

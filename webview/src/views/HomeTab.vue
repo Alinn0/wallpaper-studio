@@ -9,7 +9,7 @@
                     :alt="t('previewAlt')"
                 />
                 <video
-                    v-else-if="displayUrl && isVideo && !isThumbnailGenerating"
+                    v-else-if="displayUrl && isVideo && !isThumbnailGenerating && isThumbnailReady(mediaThumbnailKey)"
                     class="thumbnail-source"
                     :src="displayUrl"
                     muted
@@ -19,7 +19,7 @@
                     @canplay="captureVideoThumb"
                 />
                 <img
-                    v-else-if="displayUrl && !isWallpaperPkg"
+                    v-else-if="displayUrl && !isVideo && !isWallpaperPkg && isThumbnailReady(mediaThumbnailKey)"
                     class="thumbnail-source"
                     :src="displayUrl"
                     alt=""
@@ -35,6 +35,10 @@
                 <span class="meta-path" :title="displayPathTitle">
                     {{ displayPath || t('notSet') }}
                 </span>
+            </div>
+            <el-tag v-if="config.pinnedImagePath" size="small" type="info">{{ t('wallpaperPinnedHint') }}</el-tag>
+            <div v-if="config.imageLoading" class="switch-loading" role="status" aria-live="polite">
+                {{ t('wallpaperSwitchLoading') }}
             </div>
             <div class="preview-actions">
                 <el-button size="small" :title="t('previousWallpaper')" @click="onPrevious">
@@ -69,6 +73,19 @@
                 <label>{{ t('blur') }}</label>
                 <el-slider v-model="config.blur" :min="0" :max="100" :step="1" @change="setGlobalConfig('blur', config.blur)" />
             </div>
+            <div class="global-setting fps-setting">
+                <label>{{ t('targetFps') }} ({{ config.maxFps ? `${config.maxFps} Hz` : t(fpsReading ? 'fpsReading' : 'fpsNotRead') }})</label>
+                <div class="fps-controls">
+                    <el-input-number :model-value="config.targetFps" :min="15" :max="refreshLimit"
+                        :step="1" :precision="0" size="small" controls-position="right"
+                        style="width: 110px" @change="onTargetFpsChange" />
+                    <el-button size="small" :loading="fpsReading" :disabled="config.maxFps === undefined"
+                        :title="t('rereadMaxFpsHint')" :aria-label="t('rereadMaxFps')" @click="sampleDisplayRate(true)">
+                        <el-icon v-if="!fpsReading"><RefreshRight /></el-icon>
+                    </el-button>
+                </div>
+            </div>
+            <div v-if="fpsReadFailed" class="fps-error" role="alert">{{ t('fpsReadFailed') }}</div>
             <el-collapse v-model="settingsOpen">
                 <el-collapse-item name="wallpaper-properties">
                     <template #title><el-icon><Setting /></el-icon>{{ t('wallpaperPropertySettings') }}</template>
@@ -129,7 +146,8 @@ import { Picture, ArrowLeft, RefreshRight, Setting } from '@element-plus/icons-v
 import { useI18n } from '../composables/useI18n';
 import { useBridge } from '../composables/useBridge';
 import { useScenePreview } from '../composables/useScenePreview';
-import { getThumbnail, setThumbnail, thumbnailRevision } from '../composables/useThumbnailCache';
+import { useDisplayFps } from '../composables/useDisplayFps';
+import { getThumbnail, setThumbnail, thumbnailRevision, ensureThumbnails, isThumbnailReady, setCurrentPreviewKeys } from '../composables/useThumbnailCache';
 import { config, state, type WallpaperProperty } from '../composables/useStore';
 import { isVideoPath, isWallpaperPkgPath } from '../utils/media';
 import { mediaPathKey } from '../../../src/mediaTypes';
@@ -137,6 +155,13 @@ import { mediaPathKey } from '../../../src/mediaTypes';
 const { t } = useI18n();
 const bridge = useBridge();
 const scenePreview = useScenePreview();
+const { refreshLimit, fpsReading, fpsReadFailed, sampleDisplayRate } = useDisplayFps();
+function onTargetFpsChange(value: number | undefined) {
+    if (value === undefined || !Number.isFinite(value)) { return; }
+    const fps = Math.max(15, Math.min(refreshLimit.value, Math.round(value)));
+    config.targetFps = fps;
+    bridge.post({ type: 'setConfig', key: 'targetFps', value: fps });
+}
 const settingsOpen = ref<string[]>([]);
 /**
  * 相机视角（只有平移，没有缩放）。
@@ -163,6 +188,7 @@ const selectedMode = computed({
 
 // 只用扩展侧给出的本地路径。在线地址一律不直连，避免每次刷新都回源云存储。
 const displayUrl = computed(() => config.imagePathDisplay || '');
+const mediaThumbnailKey = computed(() => `${isVideoPath(config.imagePath) ? 'video' : 'image'}:${displayUrl.value}`);
 
 const isWallpaperPkg = computed(() => isWallpaperPkgPath(config.imagePath));
 const isVideo = computed(() => isVideoPath(config.imagePath));
@@ -173,7 +199,7 @@ const currentWallpaper = computed(() => {
     if (state.sourceMode === 'wallpaper') {
         return state.wallpaperPlaylist.find(item => item.active && samePath(item.path, config.imagePath)) || null;
     }
-    const source = state.sourceMode === 'folder' ? state.folderImages : state.recentImages;
+    const source = state.sourceMode === 'folder' ? state.folderImages : state.localFiles;
     const item = source.find(entry => samePath(entry.path, config.imagePath));
     return item ? { path: item.path, title: item.name, properties: item.properties || [] } : null;
 });
@@ -243,7 +269,7 @@ function fitThumbSize(width: number, height: number): { width: number; height: n
 
 function captureImageThumb(event: Event) {
     const img = event.currentTarget as HTMLImageElement | null;
-    const key = config.imagePath;
+    const key = config.imagePathDisplay;
     if (!img || !key || !img.naturalWidth || !img.naturalHeight || getThumbnail(`image:${key}`)) { return; }
     const size = fitThumbSize(img.naturalWidth, img.naturalHeight);
     const canvas = document.createElement('canvas');
@@ -260,7 +286,7 @@ function captureImageThumb(event: Event) {
 
 function captureVideoThumb(event: Event) {
     const video = event.currentTarget as HTMLVideoElement | null;
-    const key = config.imagePath;
+    const key = config.imagePathDisplay;
     if (!video || !key || !video.videoWidth || !video.videoHeight || getThumbnail(`video:${key}`)) { return; }
     const size = fitThumbSize(video.videoWidth, video.videoHeight);
     const canvas = document.createElement('canvas');
@@ -287,27 +313,31 @@ const previewThumbnail = computed(() => {
     const path = config.imagePath;
     if (!path) { return ''; }
     if (isWallpaperPkg.value) {
-        // The list stores scene frames by sceneSource (normally the package URI).
-        // Keep the raw path fallback for caches created before URI normalization.
-        return scenePreview.previewOf(config.imagePathDisplay, config.sceneRender?.properties)
-            || getThumbnail(`scene:${path}`)
-            || '';
+        return scenePreview.previewOf(config.imagePathDisplay, config.sceneRender?.properties);
     }
-    return getThumbnail(`${isVideoPath(path) ? 'video' : 'image'}:${path}`) || '';
+    return getThumbnail(`${isVideoPath(path) ? 'video' : 'image'}:${config.imagePathDisplay}`) || '';
 });
 
 let scenePreviewTimer: ReturnType<typeof setTimeout> | undefined;
+let previewGeneration = 0;
 function scheduleCurrentPreview() {
+    const generation = ++previewGeneration;
+    const keys = isWallpaperPkg.value ? scenePreview.cacheKeys(displayUrl.value, config.sceneRender?.properties) : [mediaThumbnailKey.value];
+    setCurrentPreviewKeys(displayUrl.value ? keys : []);
+    isThumbnailGenerating.value = false;
     if (scenePreviewTimer) { clearTimeout(scenePreviewTimer); }
     scenePreview.cancelPriority();
-    if (document.hidden || !isWallpaperPkg.value || !displayUrl.value) { return; }
-    scenePreviewTimer = setTimeout(() => {
-        scenePreviewTimer = undefined;
-        isThumbnailGenerating.value = true;
-        void scenePreview.requestPreview(displayUrl.value, true, config.sceneRender).finally(() => {
-            isThumbnailGenerating.value = false;
-        });
-    }, 250);
+    if (document.hidden || !displayUrl.value) { return; }
+    void ensureThumbnails(keys).then(() => {
+        if (generation !== previewGeneration || document.hidden || !isWallpaperPkg.value) { return; }
+        scenePreviewTimer = setTimeout(() => {
+            scenePreviewTimer = undefined;
+            isThumbnailGenerating.value = true;
+            void scenePreview.requestPreview(displayUrl.value, true, config.sceneRender).finally(() => {
+                if (generation === previewGeneration) { isThumbnailGenerating.value = false; }
+            });
+        }, 250);
+    });
 }
 watch([currentKey, displayUrl, () => JSON.stringify(config.sceneRender?.properties || {})], scheduleCurrentPreview, { immediate: true });
 onMounted(() => { document.addEventListener('visibilitychange', scheduleCurrentPreview); });
@@ -432,6 +462,8 @@ function onViewOffsetInput() {
     }, 60);
 }
 onUnmounted(() => {
+    previewGeneration++;
+    setCurrentPreviewKeys([]);
     document.removeEventListener('visibilitychange', scheduleCurrentPreview);
     if (scenePreviewTimer) { clearTimeout(scenePreviewTimer); }
     scenePreview.cancelPriority();
@@ -442,6 +474,7 @@ onUnmounted(() => {
 </script>
 
 <style lang="scss" scoped>
+.switch-loading { padding: 4px 0 8px; color: var(--el-color-primary); font-size: 12px; }
 .home-tab { display: flex; flex-direction: column; gap: 12px; }
 
 .preview-card :deep(.el-card__body) { padding: 10px; }
@@ -549,6 +582,11 @@ onUnmounted(() => {
     white-space: nowrap;
 }
 .global-setting .el-slider { flex: 1; }
+.fps-setting { flex-wrap: wrap; row-gap: 6px; }
+.fps-setting label { max-width: none; }
+.fps-controls { display: flex; align-items: center; gap: 4px; margin-left: auto; }
+.fps-controls .el-button { margin-left: 0; padding: 5px; }
+.fps-error { margin-top: 4px; color: var(--vscode-errorForeground); font-size: 11px; }
 
 .property-group {
     margin-top: 14px;

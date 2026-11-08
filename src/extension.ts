@@ -17,20 +17,39 @@ import {
 } from 'vscode';
 import * as fs from 'fs';
 import { PickList } from './PickList';
+import { createSharedLibraryContext } from './sharedLibrary';
+import { disposeSceneTransport } from './sceneTransport';
+import { migrateLegacyThumbnails } from './cacheMigration';
 import { setContext } from './global';
 import { CUSTOM_JS_FILE_PATH, collectStaleWindowCssFiles, detectPatchState } from './FileDom';
 import { StudioViewProvider } from './StudioViewProvider';
-import { ensureWorkspaceRecord, hasCurrentImageRecord, resolveCurrentImagePath, setCurrentBlur, setCurrentOpacity } from './windowBackground';
+import { ensureWorkspaceRecord, hasCurrentImageRecord, resolveCurrentImagePath, setCurrentBlur, setCurrentOpacity, getStagedImagePath, setStagedImagePath } from './windowBackground';
+import { cancelBackgroundSelection } from './backgroundSelection';
 import { getAppConfig, onDidChangeSettings, onDidChangeExternalSettings, startSettingsSync } from './settingsStore';
-import { clearLegacyImageRecords, pruneOrphanedWorkspaceRecords } from './runtimeStore';
+import { clearLegacyImageRecords, pruneOrphanedWorkspaceRecords, onDidChangeRuntime, startRuntimeSync } from './runtimeStore';
+import { startWorkspacePresence } from './workspaceCoordination';
+import { getWorkspaceCssToken } from './windowBackground';
+import { startDisplayRequestSync } from './displayRequests';
 
 
-export function activate(context: ExtensionContext) {
+export async function activate(context: ExtensionContext) {
+	context = await createSharedLibraryContext(context);
 	setContext(context);
+	context.subscriptions.push({ dispose: disposeSceneTransport });
+	await migrateLegacyThumbnails(context.globalStorageUri?.fsPath).catch(error =>
+		console.warn('[WallpaperStudio] Legacy thumbnail migration skipped:', error));
 	context.subscriptions.push(startSettingsSync());
+	context.subscriptions.push(startRuntimeSync(), startWorkspacePresence(getWorkspaceCssToken));
+	context.subscriptions.push(startDisplayRequestSync(() => PickList.resumeDeferredAppearance()));
+	let lastRuntimeImage = resolveCurrentImagePath();
+	context.subscriptions.push(onDidChangeRuntime(({ external }) => {
+		const current = resolveCurrentImagePath();
+		if (external && current !== lastRuntimeImage) { void PickList.refreshWorkspaceDisplay(); }
+		lastRuntimeImage = current;
+	}));
 	void (async () => {
-		await clearLegacyImageRecords();
 		await ensureWorkspaceRecord();
+		await clearLegacyImageRecords();
 		await pruneOrphanedWorkspaceRecords();
 	})().catch(error => {
 		console.warn('[WallpaperStudio] Failed to initialize workspace background state:', error);
@@ -48,6 +67,12 @@ export function activate(context: ExtensionContext) {
 	// 异步检查 VSCode 版本变化，不阻塞启动
 	checkVSCodeVersionChanged(context).then(async isChanged => {
 		if (!isChanged) {
+			const staged = getStagedImagePath();
+			if (staged) {
+				try { await PickList.applyBackgroundPath(staged, { silent: true }); }
+				catch (error) { await setStagedImagePath(''); console.warn('[WallpaperStudio] Staged background failed:', error); }
+				return;
+			}
 			const config = getAppConfig();
 			const resolved = resolveCurrentImagePath(config.imagePath || '');
 			const hasImage = !!resolved || hasCurrentImageRecord();
@@ -121,7 +146,7 @@ export function activate(context: ExtensionContext) {
 	}));
 	context.subscriptions.push(onDidChangeExternalSettings(changed => {
 		if (!changed.includes('perWindowBackground') &&
-			changed.some(key => ['opacity', 'blur', 'sizeModel', 'blendModel'].includes(key))) {
+            changed.some(key => ['opacity', 'blur', 'sizeModel', 'blendModel', 'targetFps', 'maxFps'].includes(key))) {
 			const appearanceOnly = changed.every(key => key === 'opacity' || key === 'blur');
 			if (appearanceOnly) {
 				void PickList.applyCurrentAppearance(getAppConfig()).then(applied => {
@@ -132,9 +157,11 @@ export function activate(context: ExtensionContext) {
 	}));
 	if (workspace.onDidChangeWorkspaceFolders) {
 		context.subscriptions.push(workspace.onDidChangeWorkspaceFolders(() => {
+			cancelBackgroundSelection();
 			void (async () => {
 				await PickList.applyCurrentWorkspaceBackground();
 				await ensureWorkspaceRecord();
+				PickList.startAutoRandomTask();
 			})().catch(error => {
 				console.error('[WallpaperStudio] Failed to apply workspace background:', error);
 			});
@@ -200,8 +227,7 @@ export function activate(context: ExtensionContext) {
 		}
 		const config = getAppConfig();
 		if (key === 'wallpaperStudio.opacity' || key === 'wallpaperStudio.blur') {
-			// 独立模式下透明度/模糊度按窗口+工作区记录在 globalState 里，让每个
-			// 窗口的 webview 显示各自的值；共用模式下才回写全局 settings.json。
+			// 透明度和模糊始终写共享 settings.json，所有窗口与 Profiles 一致。
 			const num = typeof value === 'number' ? value : parseFloat(value);
 			if (Number.isNaN(num)) { return; }
 			if (key === 'wallpaperStudio.opacity') {

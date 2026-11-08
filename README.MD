@@ -81,9 +81,9 @@ Wallpaper Engine。Wallpaper Engine 是 Kristjan Skutta 的产品，与本项目
 
 ## 功能特性
 
-同版本性能更新（1.0.2）：场景切换先保留旧画面，再用静态帧覆盖重建间隙；当前工作区的首帧缓存可在下次恢复时先显示。图库按可见行渲染，后台预览会取消过期任务。首次遇到新场景仍需要解析与上传贴图，实际首帧耗时取决于场景和显卡。
+同版本性能更新（1.0.2）：场景切换先保留旧画面，再用当前窗口内存中的静态帧覆盖重建间隙；图库缩略图持久化到统一缓存目录。图库按可见行渲染，后台预览会取消过期任务。首次遇到新场景仍需要解析与上传贴图，实际首帧耗时取决于场景和显卡。
 
-壁纸列表首次进入时读取，之后切换标签页或重新打开面板会复用已完成的结果，配置文件、账号或移除名单变化时再读取。顶部刷新与「重新读取配置」可强制更新；仅修改 project.json 时请使用「重新读取配置」。重新加载整个 VS Code 窗口后仍需首次读取一次。
+壁纸列表首次进入时读取，之后切换标签页或重新打开面板会复用已完成的结果。完整列表的标题、原始路径、预览路径和属性也保存在 `~/.wallpaper-studio/playlist-cache.json`；重启后检查配置、账号、移除名单和项目文件签名，未变化即可复用，无需重新解析每项。顶部刷新与「重新读取配置」可强制更新。图片、视频及场景缩略图独立缓存，命中后直接显示，未命中才为可见项目生成；视频不必先设为当前壁纸。真正读取列表时显示“已加载/总数量”。
 
 | 能力 | 说明 |
 |---|---|
@@ -172,7 +172,8 @@ code --install-extension ".\releases\current\wallpaper-studio-1.0.2.vsix" --forc
 | 预览卡 | 当前背景（图片 / 视频 / 场景包首帧）与路径 |
 | 上一张 / 随机 | 在**当前模式**候选池里切换（随机不会重复当前这张） |
 | 壁纸播放模式 | `本地文件` / `目录媒体` / `Wallpaper 播放列表` |
-| 透明度 | `0 ~ 0.8` |
+| 壁纸可见度 | `0 ~ 0.8`；新安装默认 `0.2`，`0` 隐藏壁纸；已有保存值保留 |
+| 目标 FPS | 最低 `15`，上限采用全局保存的最大 FPS；输入框右侧按钮重新读取当前屏幕上限 |
 | 模糊度 | `0 ~ 100` |
 | 壁纸设置（可折叠） | 当前壁纸的 Wallpaper Engine 配置项 + 视角 X/Y |
 
@@ -206,8 +207,8 @@ code --install-extension ".\releases\current\wallpaper-studio-1.0.2.vsix" --forc
 | 窗口背景 | 「每个窗口独立」；关闭则所有窗口共用一张（透明度/模糊度始终统一） |
 | 尺寸模式 | 填充 / 平铺 / 拉伸 / 居中 / 原始尺寸（多种对齐） |
 | 混合模式 | 自动（跟随主题）/ 正片叠底 / 变亮 |
-| 打开缓存目录 | 打开 `globalStorage/Alin0907.wallpaper-studio` |
-| 清除所有缓存与配置 | 二次确认，清空最近记录、移除名单、壁纸配置项、缩略图与插件设置 |
+| 打开缓存目录 | 打开 `~/.wallpaper-studio` |
+| 清除所有缓存与配置 | 二次确认后先备份现有配置，取消加载和轮播并关闭背景，再清理共享库、运行记录、缩略图、场景包、预览页与插件设置；失败会报错，可修复权限后重试 |
 
 ---
 
@@ -354,12 +355,18 @@ code --install-extension ".\releases\current\wallpaper-studio-1.0.2.vsix" --forc
 | 内容 | 路径 |
 |---|---|
 | 共享设置（透明度/模糊度/自动轮播/尺寸/混合模式等） | `%USERPROFILE%\.wallpaper-studio\settings.json` |
+| 最大 FPS | 同一共享 `settings.json` 的 `maxFps`；首次打开首页且尚无检测值时读取并保存，后续启动、切页、焦点及尺寸变化均复用。点击目标 FPS 右侧按钮才重新读取，所有窗口、工作区、Profiles 共用；换显示器后可手动更新 |
+| 共享来源、三模式列表、移除名单、同路径壁纸属性和视角 | `~/.wallpaper-studio/library.json` |
 | 当前背景与窗口/工作区运行状态 | `%USERPROFILE%\.wallpaper-studio\runtime.json` |
-| 缩略图缓存 / 场景预览页 | `<VS Code User>/globalStorage/Alin0907.wallpaper-studio/` |
-| 桌面端场景包副本 | `<VS Code appRoot>/out/vs/workbench/wallpaper-studio-assets/`（同一内容复用；`.pkg` 必须位于桌面协议允许的资源根目录） |
-| 场景包哈希索引 | `~/.wallpaper-studio/scene-assets/.sources/`（源文件改变后重新计算） |
-| 连续加载首帧 | 工作台 localStorage，按工作区 / 场景 / 属性隔离，最多 8 项 |
-| 移除名单 / 逐壁纸配置 / 最近使用 | VS Code `globalState` |
+| 缩略图缓存 / 场景预览页 | `~/.wallpaper-studio/thumbnails/`、`scene-preview/`（旧缩略图按需迁移） |
+| 场景包副本与索引 | `~/.wallpaper-studio/scene-assets/`（全局最多 5 包；锁内读取与 LRU 淘汰，索引 `index.json` 同样有界） |
+| 场景包读取 | 扩展绑定 `127.0.0.1` 临时端口，经随机令牌 WebSocket 发送已注册文件，断开会取消读盘；独立一次性令牌只接收渲染成功/失败回执，不接受路径、命令或文件上传。远程通过 VS Code 转发，真实远程部署尚未验收 |
+| 连续加载首帧 | 当前工作台内存，按工作区 / 场景 / 属性隔离，最多 8 项；不写 localStorage |
+| 图库和首页预览内存 | 共用缩略图缓存，最多 300 项、约 1200 万字符；场景、图片与视频共用预算，同名文件替换后失效 |
+| 预览加载顺序 | 先查面板内存，未命中则按当前及可见项目向磁盘缓存查询，确认未命中后才解码图片/视频或渲染场景。首次生成的预览批量落盘，重新打开和重启复用；文件签名变化、属性变化或容量淘汰后可能重新生成 |
+| 首页预览连续性 | 当前首页预览在同一有界缓存内优先保留，加载大量列表缩略图不会将它挤掉；打开已配置列表、切页和隐藏恢复不重建 Studio 页面 |
+| 轮播与切换协调 / 活跃窗口 | `~/.wallpaper-studio/rotation.json`、`pending-loads.json`、`sessions/`；同一显示范围内协调多个宿主，临时状态会过期 |
+| 配置重置前备份 | `~/.wallpaper-studio/backups/reset-*/`；保留备份及原始壁纸 |
 | 背景样式与加载器 | `<VS Code 安装目录>/resources/app/out/vs/workbench/css-wallpaper-studio.css`、`js-wallpaper-studio.js` |
 
 共享偏好由插件面板维护，默认值以 `src/settingsStore.ts` 为准。`settings.json` 的
@@ -367,12 +374,14 @@ code --install-extension ".\releases\current\wallpaper-studio-1.0.2.vsix" --forc
 分开维护，无需改成扩展版本号。连续加载、预览帧率和缓存策略自动生效，无需在
 VS Code `settings.json` 添加旧的 `wallpaperStudio.*` 配置；现有壁纸路径和偏好继续保留。
 
-### 后台保活（自动）
+### 切换与多窗口同步
 
-- 每 **5 秒**把当前窗口样式镜像到共享的 `css-wallpaper-studio.css`
-  → 下次打开 VS Code 立刻就有背景
-- 同时清理 **超过 60 秒**的旧会话样式文件（`css-wallpaper-studio.<session>.css`）
-  → 缓存不会越堆越大
+- 先更新播放列表选中项，再后台准备壁纸；场景收到真实就绪回执后才保存当前和上一张，失败回退。首次安装运行时需要重载时，会暂存选择并提示重载，不提前宣布渲染成功。
+- 外观修改在加载结束后补应用；连续选择和关闭会作废旧请求，其他窗口的旧任务也不能覆盖新请求。同一工作区的窗口共享当前、上一张、固定记录，不同工作区分别保存；全局设置和来源列表仍共享。
+- 模式切换只接受最新请求，旧 Wallpaper 列表读取完成后不能再选回旧模式的壁纸。后台切换的加载文字仅在首页显示，列表不显示加载文字，初次读取列表时保留转圈提示。
+- 媒体目录与预览运行页在首次加载页面前统一配置访问范围，避免逐张加载时修改权限而重建整个面板；列表自动记住识别账号不会再次启动同一轮解析。主动引入未授权的新位置时，必要的权限更新合并一次，并在同一页面会话内保留正确来源模式。
+- `runtime.json` 每 500ms 检查外部变化，面板更新状态并通知工作台重读 CSS；同一显示范围的自动轮播共用锁和成功切换时间。
+- 活跃窗口每 30 秒更新存活记录。回收超过 7 天的遗留 CSS 时保留仍活跃或有持久背景记录的工作区；不再运行旧的 5 秒样式镜像逻辑。
 
 ---
 
@@ -439,7 +448,7 @@ npm.cmd --prefix webview ci
 
 ```
 ├── src/                       # 扩展宿主（TypeScript）
-│   ├── extension.ts           # 激活入口：命令、状态栏、软写入
+│   ├── extension.ts           # 激活入口、命令与运行状态恢复
 │   ├── StudioViewProvider.ts  # 面板 ↔ 扩展桥接
 │   ├── PickList.ts            # 渲染管线、自动轮播
 │   ├── FileDom.ts             # workbench 补丁、CSS/JS 生成、场景 iframe
@@ -449,7 +458,8 @@ npm.cmd --prefix webview ci
 │   ├── sourceMode.ts          # 三种模式的唯一真源
 │   ├── settingsStore.ts       # 共享设置文件
 │   ├── thumbnailStore.ts      # 缩略图持久缓存
-│   └── backgroundSoftWrite.ts # 软写入保活
+│   ├── playlistSnapshot.ts    # 完整列表元数据缓存
+│   └── workbenchRuntime.ts   # 背景运行时与切换交接
 ├── webview/                   # Vue 3 + Element Plus 面板（Vite 构建）
 ├── resources/                 # 场景预览页、图标
 ├── scripts/                   # 构建、安装、清理与回归测试
@@ -641,3 +651,11 @@ Copyright (c) 2021 ashujiao, also released under the MIT License.
 感谢 [ashujiao](https://github.com/AShujiao) 的 vscode-background-cover、
 [shalldie](https://github.com/shalldie) 的 vscode-background、以及 WebWallGL 的作者，
 没有这些开源工作就没有这个项目。
+
+## 共享壁纸库（1.0.2）
+
+三个模式的来源配置、列表、同路径壁纸的属性及视角跨窗口和 Profiles 共享，保存在 `~/.wallpaper-studio/library.json`。目录设置及全局外观/FPS 在 `settings.json`；当前、上一张、固定背景仍按工作区保存在 `runtime.json`。
+
+首次激活新版时迁移该 Profile 的列表与参数；之后其他 Profile 以共享库为准，旧独有条目需重新添加。旧混合播放历史不会导入本地列表。修改属性会通知其他窗口并更新正在显示该壁纸的背景。
+
+详见 [设置范围说明](docs/reviews/settings-scope-2026-11-08.md) 和 [代码审查](docs/reviews/code-review-2026-11-08.md)。

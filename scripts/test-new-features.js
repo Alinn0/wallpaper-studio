@@ -304,11 +304,11 @@ const { extractBackgroundImageUrl } = require(path.join(REPO, 'out', 'loaderFrag
 
 // ---- 注入产物冒烟（A4/A5/A6 已编译进 out/）------------------------------------
 {
-    const fileDomJs = fs.readFileSync(path.join(REPO, 'out', 'FileDom.js'), 'utf-8');
+    const fileDomJs = fs.readFileSync(path.join(REPO, 'out', 'workbenchRuntime.js'), 'utf-8');
     // 预加载函数名以字面量出现在 loader 模板里
-    check('编译产物 FileDom.js 含预加载片段', fileDomJs.includes('preloadBackgroundImage'));
-    check('编译产物 FileDom.js 含换图淡入淡出片段', fileDomJs.includes('bgcApplyStyleWithFade'));
-    check('编译产物 FileDom.js 的 applyStyle 走 fade 分支', fileDomJs.includes('bgcApplyStyleWithFade(targetWindow, style, css)'));
+    check('编译产物 workbenchRuntime.js 含预加载片段', fileDomJs.includes('preloadBackgroundImage'));
+    check('编译产物 workbenchRuntime.js 含换图淡入淡出片段', fileDomJs.includes('bgcApplyStyleWithFade'));
+    check('编译产物 workbenchRuntime.js 的 applyStyle 走 fade 分支', fileDomJs.includes('bgcApplyStyleWithFade(targetWindow, style, css)'));
     // CSS 变量与过渡声明字面量位于 backgroundCss.js（FileDom.js 只做插值调用）
     const bgCssJs = fs.readFileSync(path.join(REPO, 'out', 'backgroundCss.js'), 'utf-8');
     check('编译产物含混合模式 CSS 变量', bgCssJs.includes('var(--wallpaper-studio-blend)'));

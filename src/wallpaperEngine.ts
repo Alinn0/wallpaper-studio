@@ -1,8 +1,10 @@
 import * as fs from 'fs';
+import { mutateState } from './stateMutation';
 import * as os from 'os';
 import * as path from 'path';
 import { VIDEO_EXTS } from './mediaTypes';
 import { normalizeComparablePath } from './pathComparison';
+import { playlistSnapshotKey, readPlaylistSnapshot, writePlaylistSnapshot, playlistDependencies, playlistSnapshotGeneration } from './playlistSnapshot';
 
 export const DEFAULT_WALLPAPER_CONFIG =
     'E:\\Games\\Steam\\steamapps\\common\\wallpaper_engine\\config.json';
@@ -63,6 +65,22 @@ function readUserPlaylist(root: any, user: string): string[] {
         }
     }
     return result;
+}
+
+/** Seed webview permissions from playlist paths only; do not scan project metadata. */
+export function readWallpaperResourceDirectories(configPath: string, storedUser = ''): string[] {
+    try {
+        const user = resolveActiveWallpaperUser(configPath, storedUser)?.user;
+        if (!user) { return []; }
+        const root = readJson(configPath);
+        return [...new Set(readUserPlaylist(root, user).map(value => {
+            const resolved = path.resolve(value);
+            // New subscriptions in the selected Wallpaper Engine workshop must
+            // not force the already-open Studio page to reload its permissions.
+            const workshop = /^(.*[\\/]workshop[\\/]content[\\/]431960)(?:[\\/]|$)/i.exec(resolved);
+            return workshop ? workshop[1] : path.dirname(resolved);
+        }))];
+    } catch { return []; }
 }
 
 /**
@@ -200,6 +218,8 @@ function resolvePackagePath(value: string, configPath: string, root: any): strin
 
 interface ProjectInfo {
     title: string;
+    /** Actual project title, without the directory-name fallback used by gallery entries. */
+    projectTitle?: string;
     description: string;
     preview: string;
     properties: WallpaperProperty[];
@@ -455,10 +475,10 @@ function getProjectInfo(packagePath: string): ProjectInfo {
         if (cached && cached.mtimeMs === stat.mtimeMs) { return cached.info; }
         const project = readJson(projectPath);
         const previewName = typeof project.preview === 'string' ? project.preview : 'preview.jpg';
+        const projectTitle = typeof project.title === 'string' ? stripMarkup(project.title) : '';
         const info: ProjectInfo = {
-            title: typeof project.title === 'string' && project.title.trim()
-                ? stripMarkup(project.title)
-                : path.basename(directory),
+            title: projectTitle || path.basename(directory),
+            projectTitle,
             description: typeof project.description === 'string' ? project.description : '',
             preview: path.join(directory, previewName),
             properties: readProjectProperties(project),
@@ -474,6 +494,12 @@ function getProjectInfo(packagePath: string): ProjectInfo {
     } catch {
         return { title: path.basename(directory), description: '', preview: path.join(directory, 'preview.jpg'), properties: [], projectType: '', entryFile: '' };
     }
+}
+
+/** Read just the current project's cached metadata, without loading the playlist. */
+export function getWallpaperProjectTitle(filePath: string): string {
+    if (!filePath || /^(https?|data):/i.test(filePath)) { return ''; }
+    return getProjectInfo(resolveWallpaperMediaPath(filePath)).projectTitle || '';
 }
 
 export function getWallpaperProjectProperties(filePath: string): WallpaperProperty[] {
@@ -573,8 +599,15 @@ export async function readWallpaperPlaylistAsync(
     configPath: string,
     removed: string[] = [],
     user?: string,
-    onProgress?: (loaded: number, total: number) => void
+    onProgress?: (loaded: number, total: number) => void,
+    force = false
 ): Promise<WallpaperEntry[]> {
+    const snapshotKey = playlistSnapshotKey(configPath, user, removed);
+    if (!force) {
+        const cached = readPlaylistSnapshot(snapshotKey);
+        if (cached) { onProgress?.(cached.length, cached.length); return cached; }
+    }
+    const started = playlistSnapshotGeneration();
     const root = readJson(configPath);
     const users = listWallpaperUsers(root);
     const owner = user ? users.find(item => item === user) : undefined;
@@ -584,6 +617,7 @@ export async function readWallpaperPlaylistAsync(
     const paths = targets
         .flatMap(item => readUserPlaylist(root, item))
         .map(item => resolvePackagePath(item, configPath, root));
+    const dependencies = playlistDependencies(paths);
     const entries: WallpaperEntry[] = [];
     onProgress?.(0, paths.length);
 
@@ -613,12 +647,16 @@ export async function readWallpaperPlaylistAsync(
     }
 
     const seen = new Set<string>();
-    return entries.filter(entry => {
+    const result = entries.filter(entry => {
         const key = normalize(entry.path);
         if (seen.has(key)) { return false; }
         seen.add(key);
         return true;
     });
+    if (snapshotKey === playlistSnapshotKey(configPath, user, removed)) {
+        writePlaylistSnapshot(snapshotKey, result, dependencies, started);
+    }
+    return result;
 }
 
 export function readRemovedWallpapers(globalState: { get<T>(key: string, defaultValue: T): T }): string[] {
@@ -678,16 +716,17 @@ export function removeWallpaper(
     globalState: { get<T>(key: string, defaultValue: T): T; update(key: string, value: unknown): Thenable<void> },
     wallpaperPath: string
 ): Thenable<void> {
-    const current = readRemovedWallpapers(globalState);
     const key = normalize(wallpaperPath);
-    const next = [...current.filter(item => normalize(item) !== key), wallpaperPath];
-    return globalState.update(REMOVED_KEY, next);
+    return mutateState(globalState, REMOVED_KEY, [] as string[], current =>
+        [...current.filter(item => normalize(item) !== key), wallpaperPath]);
 }
 
 export function getWallpaperPropertyOverrides(
     globalState: { get<T>(key: string, defaultValue: T): T },
     wallpaperPath: string
 ): Record<string, unknown> {
+    const shared = globalState as typeof globalState & { getRecordEntry?: (key: string, entry: string) => Record<string, unknown> | undefined };
+    if (shared.getRecordEntry) { return shared.getRecordEntry(PROPERTIES_KEY, normalize(wallpaperPath)) || {}; }
     const all = globalState.get<Record<string, Record<string, unknown>>>(PROPERTIES_KEY, {});
     return all[normalize(wallpaperPath)] || {};
 }
@@ -698,12 +737,7 @@ export async function setWallpaperProperty(
     key: string,
     value: unknown
 ): Promise<void> {
-    const all = globalState.get<Record<string, Record<string, unknown>>>(PROPERTIES_KEY, {});
-    const current = all[normalize(wallpaperPath)] || {};
-    await globalState.update(PROPERTIES_KEY, {
-        ...all,
-        [normalize(wallpaperPath)]: { ...current, [key]: value }
-    });
+    await setWallpaperProperties(globalState, wallpaperPath, { [key]: value });
 }
 
 export async function setWallpaperProperties(
@@ -711,10 +745,8 @@ export async function setWallpaperProperties(
     wallpaperPath: string,
     properties: Record<string, unknown>
 ): Promise<void> {
-    const all = globalState.get<Record<string, Record<string, unknown>>>(PROPERTIES_KEY, {});
-    const current = all[normalize(wallpaperPath)] || {};
-    await globalState.update(PROPERTIES_KEY, {
+    await mutateState(globalState, PROPERTIES_KEY, {} as Record<string, Record<string, unknown>>, all => ({
         ...all,
-        [normalize(wallpaperPath)]: { ...current, ...properties }
-    });
+        [normalize(wallpaperPath)]: { ...(all[normalize(wallpaperPath)] || {}), ...properties }
+    }));
 }

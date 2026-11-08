@@ -36,11 +36,11 @@
                 <el-input v-model="wallpaperSearch" size="small" clearable :placeholder="t('searchWallpapers')" />
                 <el-button size="small" type="primary" :title="t('randomWallpaper')" @click="onRandomWallpaper"><el-icon><RefreshRight /></el-icon></el-button>
             </div>
+            <div v-if="isLoadingPlaylist" class="playlist-progress" role="status">{{ displayLoadingDescription }}</div>
             <div v-if="displayWallpapers.length === 0" class="playlist-empty">
                 <!-- 触发加载后就在空态原来的位置显示实时进度，而不是「没有壁纸」。 -->
-                <div v-if="isLoadingPlaylist" class="playlist-loading">
+                <div v-if="isLoadingPlaylist" class="playlist-loading" role="status" :aria-label="displayLoadingDescription">
                     <el-icon class="is-loading playlist-loading-icon"><Loading /></el-icon>
-                    <span>{{ displayLoadingDescription }}</span>
                 </div>
                 <el-empty v-else :description="emptyDescription" :image-size="50" />
             </div>
@@ -48,19 +48,20 @@
                 <div :style="{ height: Math.max(0, displayWallpapers.length * ROW_HEIGHT - 6) + 'px', position: 'relative', flexShrink: 0 }">
                 <div v-for="(wallpaper, index) in visibleWallpapers" :key="wallpaper.path" class="wallpaper-row" :style="{ position: 'absolute', top: (windowStart + index) * ROW_HEIGHT + 'px', left: 0, right: 0 }" :class="{ 'is-current': wallpaper.path === config.imagePath }" :data-pkg="sceneKey(wallpaper)" :ref="registerThumb" @click="onSelectWallpaper(wallpaper)" @mouseenter="onPkgHover(sceneKey(wallpaper))" @contextmenu.prevent="onRowContextMenu($event, wallpaper.path)">
                     <video
-                        v-if="(wallpaper.mediaSource || wallpaper.preview) && isVideoPath(wallpaper.path) && !mediaFrames[wallpaper.path]"
+                        v-if="(wallpaper.mediaSource || wallpaper.preview) && isVideoPath(wallpaper.path) && !mediaFrames[imageKey(wallpaper)] && isThumbnailReady(mediaCacheKey(wallpaper))"
+                        :key="imageKey(wallpaper)"
                         :src="wallpaper.mediaSource || wallpaper.preview"
-                        :data-video="wallpaper.path"
+                        :data-video="imageKey(wallpaper)"
                         :ref="registerVideoThumb"
                         muted
                         playsinline
                         preload="none"
                         class="wallpaper-preview"
-                        @loadedmetadata="captureVideoFrame($event, wallpaper.path)"
-                        @loadeddata="captureVideoFrame($event, wallpaper.path)"
-                        @canplay="captureVideoFrame($event, wallpaper.path)"
+                        @loadedmetadata="captureVideoFrame($event, imageKey(wallpaper))"
+                        @loadeddata="captureVideoFrame($event, imageKey(wallpaper))"
+                        @canplay="captureVideoFrame($event, imageKey(wallpaper))"
                     />
-                    <img v-else-if="isVideoPath(wallpaper.path) && mediaFrames[wallpaper.path]" :src="mediaFrames[wallpaper.path]" :alt="wallpaper.title" class="wallpaper-preview" />
+                    <img v-else-if="isVideoPath(wallpaper.path) && mediaFrames[imageKey(wallpaper)]" :src="mediaFrames[imageKey(wallpaper)]" :alt="wallpaper.title" class="wallpaper-preview" />
                     <img v-else-if="isWallpaperPkgPath(wallpaper.path) && pkgFrames[sceneKey(wallpaper)]" :src="pkgFrames[sceneKey(wallpaper)]" :alt="t('scenePreviewAlt')" class="wallpaper-preview" />
                     <div v-else-if="isWallpaperPkgPath(wallpaper.path)" class="wallpaper-preview wallpaper-preview-empty" :title="pkgErrors[sceneKey(wallpaper)] || t('scenePreviewRendering')">
                         <el-icon v-if="pkgLoading[sceneKey(wallpaper)]" class="is-loading"><Loading /></el-icon>
@@ -68,12 +69,20 @@
                         <el-icon v-else><Picture /></el-icon>
                     </div>
                     <img v-else-if="mediaFrames[imageKey(wallpaper)]" :src="mediaFrames[imageKey(wallpaper)]" :alt="wallpaper.title" class="wallpaper-preview" />
-                    <img v-else-if="wallpaper.preview" :src="wallpaper.preview" :alt="wallpaper.title" loading="lazy" class="wallpaper-preview" @load="captureImageThumb($event, imageKey(wallpaper))" />
+                    <img v-else-if="wallpaper.preview && !isVideoPath(wallpaper.path) && isThumbnailReady(mediaCacheKey(wallpaper))" :src="wallpaper.preview" :alt="wallpaper.title" loading="lazy" class="wallpaper-preview" @load="captureImageThumb($event, imageKey(wallpaper))" />
                     <div v-else class="wallpaper-preview wallpaper-preview-empty"><el-icon><Picture /></el-icon></div>
                     <div class="wallpaper-info">
                         <strong :title="wallpaper.title">{{ wallpaper.title }}</strong>
                     </div>
+                    <div class="wallpaper-actions">
+                    <el-button size="small" text :type="isPinned(wallpaper.path) ? 'primary' : 'default'"
+                        :title="t(isPinned(wallpaper.path) ? 'unpinWallpaper' : 'pinWallpaper')"
+                        :aria-label="t(isPinned(wallpaper.path) ? 'unpinWallpaper' : 'pinWallpaper')"
+                        :aria-pressed="isPinned(wallpaper.path)" @click.stop="onPinWallpaper(wallpaper.path)">
+                        <el-icon><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M8 3h8M9 3v6l-3 3v2h12v-2l-3-3V3M12 14v7" /></svg></el-icon>
+                    </el-button>
                     <el-button size="small" text type="danger" :title="t('removeFromPlaylist')" @click.stop="onRemoveWallpaper(wallpaper.path)"><el-icon><Delete /></el-icon></el-button>
+                    </div>
                 </div>
                 </div>
             </div>
@@ -105,7 +114,8 @@ import { useScenePreview } from '../composables/useScenePreview';
 import { config, state } from '../composables/useStore';
 import { ActionType } from '../constants';
 import { isVideoPath, isWallpaperPkgPath } from '../utils/media';
-import { getThumbnail, setThumbnail } from '../composables/useThumbnailCache';
+import { getThumbnail, setThumbnail, thumbnailView, ensureThumbnails, isThumbnailReady } from '../composables/useThumbnailCache';
+import { mediaPathKey } from '../../../src/mediaTypes';
 
 const { t } = useI18n();
 const bridge = useBridge();
@@ -170,7 +180,7 @@ const displayWallpapers = computed<GalleryItem[]>(() => {
                 sceneSource: item.sceneSource || '',
                 active: true
             }))
-        : (state.sourceMode === 'folder' ? state.folderImages : state.recentImages)
+        : (state.sourceMode === 'folder' ? state.folderImages : state.localFiles)
             .map(item => ({
                 path: item.path,
                 title: item.name,
@@ -208,13 +218,13 @@ watch(displayWallpapers, () => {
     }
 });
 
-/** pkg 的 webview URI → 已渲染的首帧 dataURL（只增不减，最多几十帧 JPEG）。 */
-const pkgFrames = reactive<Record<string, string>>({});
+/** pkg 的 webview URI → 共用有界缩略图缓存中的首帧，不另存图片副本。 */
+const pkgFrames = thumbnailView(key => `scene:${key}`);
 /** pkg 的 webview URI → 正在渲染 */
 const pkgLoading = reactive<Record<string, boolean>>({});
 /** pkg 的 webview URI → 失败原因 */
 const pkgErrors = reactive<Record<string, string>>({});
-const mediaFrames = reactive<Record<string, string>>({});
+const mediaFrames = thumbnailView(key => `${isVideoPath(key) ? 'video' : 'image'}:${key}`);
 
 /**
  * 抓取视频首帧做缩略图。
@@ -235,9 +245,12 @@ function fitThumbSize(width: number, height: number): { width: number; height: n
     };
 }
 
-/** 图片缩略图缓存键：按壁纸路径，避免同一张图重复编码。 */
-function imageKey(wallpaper: { path: string }): string {
-    return wallpaper.path;
+/** 使用包含文件签名的媒体 URI，与首页共享缓存键。 */
+function imageKey(wallpaper: { path: string; mediaSource?: string; preview?: string }): string {
+    return wallpaper.mediaSource || wallpaper.preview || wallpaper.path;
+}
+function mediaCacheKey(wallpaper: GalleryItem): string {
+    return `${isVideoPath(wallpaper.path) ? 'video' : 'image'}:${imageKey(wallpaper)}`;
 }
 
 /**
@@ -270,7 +283,8 @@ function captureVideoFrame(event: Event, key: string) {
     const video = event.currentTarget as HTMLVideoElement | null;
     if (!video || !video.videoWidth || !video.videoHeight) { return; }
     if (video.readyState < HTMLMediaElement.HAVE_CURRENT_DATA) {
-        void video.play().then(() => captureVideoFrame(event, key)).catch(() => undefined);
+        // preload=auto 会继续解码；等待 loadeddata/canplay 再捕获。
+        // DOM 事件的 currentTarget 在异步回调中已被清空，不能靠 play().then 重用事件。
         return;
     }
     const size = fitThumbSize(video.videoWidth, video.videoHeight);
@@ -292,16 +306,18 @@ function captureVideoFrame(event: Event, key: string) {
 
 /** 首帧缓存优先：命中就直接用，不再加载视频文件。 */
 function hydrateVideoThumbnails() {
+    void ensureThumbnails(visibleWallpapers.value.map(item => isWallpaperPkgPath(item.path) ? `scene:${sceneKey(item)}` : mediaCacheKey(item)));
     visibleWallpapers.value.forEach(item => {
-        if (mediaFrames[item.path]) { return; }
+        const key = imageKey(item);
+        if (mediaFrames[key]) { return; }
         if (isVideoPath(item.path)) {
-            const cached = getThumbnail(`video:${item.path}`);
-            if (cached) { mediaFrames[item.path] = cached; }
+            const cached = getThumbnail(`video:${key}`);
+            if (cached) { mediaFrames[key] = cached; }
             return;
         }
         if (!isWallpaperPkgPath(item.path)) {
-            const cached = getThumbnail(`image:${item.path}`);
-            if (cached) { mediaFrames[item.path] = cached; }
+            const cached = getThumbnail(`image:${key}`);
+            if (cached) { mediaFrames[key] = cached; }
         }
     });
 }
@@ -326,6 +342,12 @@ onUnmounted(() => { if (reloadTimer) { clearTimeout(reloadTimer); } });
 function onRandomWallpaper() { bridge.post({ type: 'randomWallpaper' }); }
 function onSelectWallpaper(wallpaper: { path: string }) {
     bridge.post({ type: 'useWallpaper', path: wallpaper.path });
+}
+function isPinned(path: string): boolean {
+    return !!config.pinnedImagePath && mediaPathKey(path) === mediaPathKey(config.pinnedImagePath);
+}
+function onPinWallpaper(path: string) {
+    bridge.post({ type: 'setWallpaperPinned', path, pinned: !isPinned(path) });
 }
 function onRemoveWallpaper(path: string) { bridge.post({ type: 'removePlaylistItem', path, mode: state.sourceMode }); }
 
@@ -374,7 +396,8 @@ let observedVideos = new WeakSet<Element>();
 /** 视频缩略图：默认 preload=none，只有进入视口（或就是当前壁纸）才开始加载。 */
 function registerVideoThumb(el: any) {
     const node = el as HTMLVideoElement | null;
-    if (!node || !node.getClientRects().length || !node.dataset.video || node.dataset.thumbRequested || observedVideos.has(node)) { return; }
+    // ref 可能在布局前或 Tab 隐藏时触发。先观察，IntersectionObserver 会在可见时加载。
+    if (!node || !node.dataset.video || node.dataset.thumbRequested || observedVideos.has(node)) { return; }
     observedVideos.add(node);
     if (node.closest('.is-current')) {
         node.dataset.thumbRequested = 'true';
@@ -460,6 +483,9 @@ function scanThumbs() {
 }
 
 watch(visibleWallpapers, () => {
+    // el-card 的 slot 可以单独更新而不触发本组件 onUpdated。
+    // 列表异步到达后必须主动查缓存，否则视频一直停留在 isThumbnailReady=false。
+    hydrateVideoThumbnails();
     scenePreview.cancelQueuedExcept(new Set(visibleWallpapers.value.map(sceneKey).filter(Boolean)));
     observer?.disconnect();
     videoObserver?.disconnect();
@@ -586,6 +612,7 @@ onUnmounted(() => {
 .wallpaper-preview { width: 72px; height: 40px; object-fit: cover; border-radius: 4px; background: #000; flex: 0 0 auto; }
 .wallpaper-preview-empty { display: flex; align-items: center; justify-content: center; color: var(--vscode-descriptionForeground); }
 .playlist-loading-icon { font-size: 34px; color: var(--el-color-primary); }
+.playlist-progress { width: 100%; min-width: 0; margin-bottom: 8px; color: var(--vscode-descriptionForeground); font-size: 12px; overflow-wrap: anywhere; }
 .playlist-loading {
     display: flex;
     flex-direction: column;
@@ -597,6 +624,8 @@ onUnmounted(() => {
 }
 .wallpaper-info { min-width: 0; flex: 1; display: flex; flex-direction: column; gap: 2px; }
 .wallpaper-info strong { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.wallpaper-actions { display: flex; align-items: center; gap: 2px; flex: 0 0 auto; }
+.wallpaper-actions .el-button { margin-left: 0; width: 24px; height: 24px; padding: 4px; }
 
 
 .folder-header {

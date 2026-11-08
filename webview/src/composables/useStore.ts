@@ -1,4 +1,5 @@
 import { reactive } from 'vue';
+import { useBridge } from './useBridge';
 import type { SceneRenderConfig } from '../../../src/sceneRender';
 
 
@@ -10,8 +11,11 @@ export interface StudioConfig {
     opacity: number;
     blur: number;
     imagePath: string;
+    /** Temporary selection while the host prepares the actual background. */
+    imageLoading: boolean;
     imagePathDisplay: string;     // webview URI for <img src>
     imagePathLabel: string;
+    pinnedImagePath: string;
     /** 当前背景（三种来源通用）的完整 Wallpaper Engine 配置项 */
     imageProperties: WallpaperProperty[];
     /** 当前背景的项目声明（交给场景渲染器，缺了它属性值绑不回画面） */
@@ -19,6 +23,9 @@ export interface StudioConfig {
     sceneRender?: SceneRenderConfig;
     autoStatus: boolean;
     autoInterval: number;
+    targetFps: number;
+    /** undefined until the first host snapshot; 0 means not measured. */
+    maxFps?: number;
     sizeModel: string;
     blendModel: string;
     randomImageFolder: string;
@@ -27,8 +34,9 @@ export interface StudioConfig {
 }
 
 export interface StudioState {
+    libraryError: string;
     sourceMode: 'file' | 'folder' | 'wallpaper';
-    recentImages: Array<{ path: string; display: string; name: string; properties?: WallpaperProperty[] }>;
+    localFiles: Array<{ path: string; display: string; name: string; properties?: WallpaperProperty[] }>;
     folderImages: Array<{ path: string; display: string; name: string; properties?: WallpaperProperty[] }>;
     folderImagesTotal: number;
     wallpaperConfigPath: string;
@@ -76,21 +84,35 @@ export const config = reactive<StudioConfig>({
     opacity: 0.2,
     blur: 0,
     imagePath: '',
+    imageLoading: false,
     imagePathDisplay: '',
     imagePathLabel: '',
+    pinnedImagePath: '',
     imageProperties: [],
     imageProject: undefined,
     autoStatus: false,
     autoInterval: 0,
+    targetFps: 60,
     sizeModel: 'cover',
     blendModel: 'auto',
     randomImageFolder: '',
     perWindowBackground: true,
 });
 
+function initialSourceMode(): StudioState['sourceMode'] {
+    if (typeof document === 'undefined') { return 'wallpaper'; }
+    const session = document.querySelector?.('meta[name="wallpaper-studio-view-session"]')?.getAttribute('content');
+    const saved = useBridge().getState<{ sourceSnapshot: { session: string; mode: string } }>().sourceSnapshot;
+    // A permissions-only reload reuses the HTML; a fresh host render has a new session.
+    const mode = session && saved?.session === session ? saved.mode
+        : document.querySelector?.('meta[name="wallpaper-studio-source-mode"]')?.getAttribute('content');
+    return mode === 'file' || mode === 'folder' ? mode : 'wallpaper';
+}
+
 export const state = reactive<StudioState>({
-    sourceMode: 'file',
-    recentImages: [],
+    libraryError: '',
+    sourceMode: initialSourceMode(),
+    localFiles: [],
     folderImages: [],
     folderImagesTotal: 0,
     wallpaperConfigPath: '',
@@ -148,6 +170,10 @@ export function applyState(data: any) {
     if (!data) { return; }
     if (data.config) { assignClean('config', config, data.config); }
     if (data.state)  { assignClean('state', state, data.state); }
+    if (data.state?.sourceMode && typeof document !== 'undefined') {
+        const session = document.querySelector?.('meta[name="wallpaper-studio-view-session"]')?.getAttribute('content');
+        if (session) { useBridge().patchState({ sourceSnapshot: { session, mode: state.sourceMode } }); }
+    }
     if (typeof data.brandLogo === 'string') { brand.logo = data.brandLogo; }
     if (typeof data.brandName === 'string') { brand.name = data.brandName; }
 }

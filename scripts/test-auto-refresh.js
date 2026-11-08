@@ -90,7 +90,7 @@ Module._load = function (request) {
 };
 
 const { setContext } = require('../out/global');
-const { setCurrentImagePath } = require('../out/windowBackground');
+const { setCurrentImagePath, getPinnedImagePath, getPreviousImagePath } = require('../out/windowBackground');
 const { PickList } = require('../out/PickList');
 Module._load = originalLoad;
 
@@ -103,6 +103,9 @@ PickList.prototype.updateDom = async function () {
 
 const originalSetInterval = global.setInterval;
 const originalClearInterval = global.clearInterval;
+const originalDateNow = Date.now;
+let logicalNow = originalDateNow();
+Date.now = () => logicalNow;
 global.setInterval = (callback, intervalMilliseconds) => {
     const timer = { callback, intervalMilliseconds, elapsedMilliseconds: 0 };
     scheduledTimers.add(timer);
@@ -111,11 +114,17 @@ global.setInterval = (callback, intervalMilliseconds) => {
 global.clearInterval = timer => scheduledTimers.delete(timer);
 
 async function advanceTime(milliseconds) {
-    for (const timer of [...scheduledTimers]) {
-        timer.elapsedMilliseconds += milliseconds;
-        while (scheduledTimers.has(timer) && timer.elapsedMilliseconds >= timer.intervalMilliseconds) {
-            timer.elapsedMilliseconds -= timer.intervalMilliseconds;
-            await timer.callback();
+    const end = logicalNow + milliseconds;
+    while (logicalNow < end) {
+        const timers = [...scheduledTimers];
+        const step = Math.min(end - logicalNow, ...timers.map(timer => timer.intervalMilliseconds - timer.elapsedMilliseconds));
+        logicalNow += step;
+        for (const timer of timers) { timer.elapsedMilliseconds += step; }
+        for (const timer of timers) {
+            if (scheduledTimers.has(timer) && timer.elapsedMilliseconds >= timer.intervalMilliseconds) {
+                timer.elapsedMilliseconds -= timer.intervalMilliseconds;
+                await timer.callback();
+            }
         }
     }
 }
@@ -123,6 +132,7 @@ async function advanceTime(milliseconds) {
 async function resetFixture(overrides = {}) {
     PickList.stopAutoRandomTask();
     scheduledTimers.clear();
+    fs.rmSync(path.join(process.env.WALLPAPER_STUDIO_DATA_DIR, 'rotation.json'), { force: true });
     globalState.clear();
     globalState.set('wallpaperStudioSourceMode', 'folder');
     appliedImages.length = 0;
@@ -148,7 +158,7 @@ async function resetFixture(overrides = {}) {
             }
         }
     });
-    await setCurrentImagePath(localImages[0]);
+    await setCurrentImagePath(localImages[0], { pin: false });
 }
 
 async function runTest(name, run) {
@@ -214,9 +224,61 @@ async function main() {
         );
     });
 
+
+    await runTest('固定优先于轮播，固定之间切换保持停止，普通切换恢复完整间隔', async () => {
+        await resetFixture({ autoStatus: false, autoInterval: 0 });
+        await PickList.setWallpaperPinned(localImages[0], true);
+        assert.equal(getPinnedImagePath(), localImages[0]);
+        assert.equal(scheduledTimers.size, 0);
+        await PickList.setWallpaperPinned(localImages[1], true);
+        assert.equal(getPinnedImagePath(), localImages[1]);
+        assert.equal(settings.autoStatus, false);
+        assert.equal(scheduledTimers.size, 0);
+        assert.equal(await PickList.autoUpdateBackground(), false);
+        await PickList.applyBackgroundPath(localImages[2]);
+        assert.equal(getPinnedImagePath(), '');
+        assert.equal(getPreviousImagePath(), localImages[1]);
+        assert.equal(settings.autoStatus, true);
+        assert.equal(settings.autoInterval, 60);
+        assert.equal(scheduledTimers.size, 1);
+        const count = appliedImages.length;
+        await advanceTime(59000); assert.equal(appliedImages.length, count);
+        await advanceTime(1000); assert.equal(appliedImages.length, count + 1);
+    });
+
+    await runTest('手动切换和自动切换均重置完整倒计时，取消固定恢复轮播', async () => {
+        await resetFixture();
+        PickList.startAutoRandomTask();
+        await advanceTime(599000);
+        await PickList.applyBackgroundPath(localImages[1]);
+        await advanceTime(599000); assert.equal(appliedImages.length, 1);
+        await advanceTime(1000); assert.equal(appliedImages.length, 2);
+        await advanceTime(599000); assert.equal(appliedImages.length, 2);
+        await PickList.setWallpaperPinned(localImages[0], true);
+        await advanceTime(1200000); assert.equal(appliedImages.length, 3);
+        await PickList.setWallpaperPinned(localImages[0], false);
+        assert.equal(scheduledTimers.size, 1);
+        await advanceTime(600000); assert.equal(appliedImages.length, 4);
+    });
+
+    await runTest('失败的切换保留固定、当前和上一张记录', async () => {
+        await resetFixture();
+        await PickList.setWallpaperPinned(localImages[0], true);
+        const previous = getPreviousImagePath();
+        const successfulUpdate = PickList.prototype.updateDom;
+        try {
+            PickList.prototype.updateDom = async () => ({ applied: false, requiresReload: false });
+            assert.equal(await PickList.applyBackgroundPath(localImages[1]), false);
+            assert.equal(getPinnedImagePath(), localImages[0]);
+            assert.equal(getPreviousImagePath(), previous);
+            assert.equal(scheduledTimers.size, 0);
+        } finally { PickList.prototype.updateDom = successfulUpdate; }
+    });
+
     PickList.prototype.updateDom = originalUpdateDom;
     global.setInterval = originalSetInterval;
     global.clearInterval = originalClearInterval;
+    Date.now = originalDateNow;
     fs.rmSync(temporaryRoot, { recursive: true, force: true });
 
     if (failures) {

@@ -1,36 +1,15 @@
 import * as crypto from 'crypto';
 import * as path from 'path';
 import { ConfigurationTarget, env, workspace, WorkspaceConfiguration } from 'vscode';
-import { getContext, onDidChangeGlobalState } from './global';
+import { onDidChangeGlobalState } from './global';
 import { getAppConfig } from './settingsStore';
 import { readRuntimeState, updateRuntimeState } from './runtimeStore';
 import { normalizeComparablePath } from './pathComparison';
 
-const WORKSPACE_IMAGES_KEY = 'wallpaperStudio.workspaceImages';
-// 全局兜底图。以前这个角色由 settings.json 的 wallpaperStudio.imagePath 承担，
-// 但那份值只在首次为空时写入、之后永久冻结，settings.json 会长期停留在用户第一次
-// 选的那张图上。改用独立的 globalState key 后，settings.json 只作为老用户的迁移
-// 兜底读取，扩展不再回写它。
 const NO_WORKSPACE_KEY = 'no-workspace';
 
-// 透明度/模糊度与背景图走同一套「窗口(session) → 工作区 → 兜底」的解析链，
-// 让不同工作区的窗口在 webview 里各自显示自己的数值。区别只在最后一层：
-// 背景图有 globalState 里的"最后一张全局兜底"，透明度/模糊度则直接落到
-// settings.json 的配置值——用户在某窗口调透明度不应该把其他窗口的显示值也
-// 刷成同一个数（而且那些窗口的实际渲染用的仍是它们各自记录的旧值，数值跟着
-// 全局配置走反而会造成"显示值与实际效果不一致"的困惑）。
-const WINDOW_OPACITY_KEY = 'wallpaperStudio.windowOpacity';
-const WORKSPACE_OPACITY_KEY = 'wallpaperStudio.workspaceOpacity';
-const WINDOW_BLUR_KEY = 'wallpaperStudio.windowBlur';
-const WORKSPACE_BLUR_KEY = 'wallpaperStudio.workspaceBlur';
-
-// window 记录以 session 为键，而 session 每次启动/重载都会变，这张表只增不减。
-// 保留最近若干条(按插入顺序淘汰)，当前窗口的记录永不淘汰。
-const MAX_WINDOW_RECORDS = 40;
-
-// 非持久化更新(定时自动换图)只改内存：既避免每个间隔都写两个 globalState key
-// 并连带刷新 TreeView/Studio，也避免把"换图失败的地址"落盘。session 结束即失效，
-// 这本身就是 persist=false 期望的语义。
+// Limit retained workspace records; transient overrides remain in this host only.
+const MAX_WORKSPACE_RECORDS = 40;
 let volatileImagePath: string | undefined;
 
 /**
@@ -135,36 +114,85 @@ export function resolveCurrentImagePath(globalFallback?: string): string {
     return getPersistedCurrentImage(globalFallback);
 }
 
+export function getPreviousImagePath(): string {
+    return readRuntimeState().workspacePreviousImages[getWorkspaceKey() || NO_WORKSPACE_KEY] || '';
+}
+
+export function getStagedImagePath(): string {
+    return readRuntimeState().workspaceStagedImages[getWorkspaceKey() || NO_WORKSPACE_KEY] || '';
+}
+
+export async function setStagedImagePath(imagePath: string, shouldPersist: () => boolean = () => true): Promise<void> {
+    const key = getWorkspaceKey() || NO_WORKSPACE_KEY;
+    const saved = await updateRuntimeState(runtime => {
+        if (!shouldPersist()) { return; }
+        if (imagePath) { runtime.workspaceStagedImages[key] = imagePath; runtime.workspaceStagedImages = pruneRecords(runtime.workspaceStagedImages, key); }
+        else { delete runtime.workspaceStagedImages[key]; }
+    });
+    if (!saved) { throw Error('Failed to save staged wallpaper'); }
+}
+
+/** Pins share the same workspace lifetime as the current background. */
+export function getPinnedImagePath(): string {
+    const runtime = readRuntimeState();
+    const key = getWorkspaceKey() || NO_WORKSPACE_KEY;
+    const pinned = runtime.workspacePinnedImages[key] || '';
+    return pinned && normalizeComparablePath(pinned) === normalizeComparablePath(runtime.workspaceImages[key] || '')
+        ? pinned : '';
+}
+
+export async function clearPinnedImagePath(expectedPath: string, shouldPersist: () => boolean): Promise<void> {
+    const key = getWorkspaceKey() || NO_WORKSPACE_KEY;
+    const saved = await updateRuntimeState(runtime => {
+        if (shouldPersist() && normalizeComparablePath(runtime.workspacePinnedImages[key] || '') === normalizeComparablePath(expectedPath)) {
+            delete runtime.workspacePinnedImages[key];
+        }
+    });
+    if (!saved) { throw new Error('Failed to save wallpaper pin'); }
+    onDidChangeGlobalState.fire();
+}
+
 export interface SetImageOptions {
     /** false 表示只更新当前窗口的内存态，不写入 runtime.json。 */
     persist?: boolean;
     workspaceKey?: string;
     shouldPersist?: () => boolean;
+    /** Set/clear pin with the successful background change. */
+    pin?: boolean;
 }
 
 /**
  * 把值按当前打开的文件夹写入 runtime.json。无工作区时使用固定的
  * no-workspace 键；同一文件夹的多个 VS Code 窗口因此共享同一张壁纸。
  */
-async function persistLevelValue(
-    workspaceKey: string,
-    value: string | number,
+async function persistWorkspaceImage(
+    value: string,
     options: SetImageOptions = {}
 ): Promise<void> {
     const workspaceHash = options.workspaceKey ?? getWorkspaceKey();
     let committed = false;
     const saved = await updateRuntimeState(runtime => {
         if (options.shouldPersist && !options.shouldPersist()) { return; }
-        const workspaceMap: Record<string, string | number> = workspaceKey === WORKSPACE_IMAGES_KEY
-            ? runtime.workspaceImages
-            : workspaceKey === WORKSPACE_OPACITY_KEY ? runtime.workspaceOpacity : runtime.workspaceBlur;
+        const workspaceMap = runtime.workspaceImages;
         if (workspaceHash) {
             committed = true;
+            delete runtime.workspaceStagedImages[workspaceHash];
+            const previous = runtime.workspaceImages[workspaceHash] || '';
+            const next = String(value);
+            const changed = normalizeComparablePath(previous) !== normalizeComparablePath(next);
+            if (changed && previous) { runtime.workspacePreviousImages[workspaceHash] = previous; }
+            if (options.pin && next) { runtime.workspacePinnedImages[workspaceHash] = next; }
+            else if (changed || options.pin === false || !next) { delete runtime.workspacePinnedImages[workspaceHash]; }
             delete workspaceMap[workspaceHash];
             workspaceMap[workspaceHash] = value;
             const prunedWorkspaceMap = pruneRecords(workspaceMap, workspaceHash);
             Object.keys(workspaceMap).forEach(key => {
-                if (!(key in prunedWorkspaceMap)) { delete workspaceMap[key]; }
+                if (!(key in prunedWorkspaceMap)) {
+                    delete workspaceMap[key];
+                    delete runtime.workspacePreviousImages[key];
+                    delete runtime.workspacePinnedImages[key];
+                    delete runtime.workspaceStagedImages[key];
+                }
             });
         }
     });
@@ -184,7 +212,7 @@ export async function setCurrentImagePath(imagePath: string, options: SetImageOp
     }
 
     // 有显式持久化写入时，内存态的临时图就失去意义了。
-    await persistLevelValue(WORKSPACE_IMAGES_KEY, value, options);
+    await persistWorkspaceImage(value, options);
 }
 
 /**
@@ -221,46 +249,26 @@ export function resolveCurrentBlur(settingsFallback: number): number {
  *
  * 只写共享设置文件；不再往 globalState 的窗口/工作区映射里写 ——
  * 那份数据按 profile 隔离，正是"切 profile 后数值错乱"的来源。
- * 顺手把历史遗留的映射清空一次，避免老版本数据继续影响别的窗口。
+ * 历史映射在启动迁移时清理，runtime.json 不再保存这些无效字段。
  */
 export async function setCurrentOpacity(value: number, cfg: WorkspaceConfiguration): Promise<void> {
     if (!Number.isFinite(value)) { return; }
     await cfg.update('opacity', clampOpacity(value), ConfigurationTarget.Global);
-    await purgeLegacyLevelRecords();
 }
 
 /** 写入模糊度，语义同 setCurrentOpacity。 */
 export async function setCurrentBlur(value: number, cfg: WorkspaceConfiguration): Promise<void> {
     if (!Number.isFinite(value)) { return; }
     await cfg.update('blur', clampBlur(value), ConfigurationTarget.Global);
-    await purgeLegacyLevelRecords();
-}
-
-/** 清掉按 profile 存储的旧透明度/模糊度记录（一次性，失败不影响主流程）。 */
-let legacyLevelPurged = false;
-async function purgeLegacyLevelRecords(): Promise<void> {
-    if (legacyLevelPurged) { return; }
-    legacyLevelPurged = true;
-    try {
-        const state = getContext().globalState;
-        for (const key of [WINDOW_OPACITY_KEY, WORKSPACE_OPACITY_KEY, WINDOW_BLUR_KEY, WORKSPACE_BLUR_KEY]) {
-            if (state.get<unknown>(key) !== undefined) {
-                await state.update(key, undefined);
-            }
-        }
-    } catch {
-        // 清理失败只影响"旧值残留"，下一次启动会再试。
-        legacyLevelPurged = false;
-    }
 }
 
 function pruneRecords<T extends string | number>(map: Record<string, T>, keepKey: string): Record<string, T> {
     const keys = Object.keys(map);
-    if (keys.length <= MAX_WINDOW_RECORDS) {
+    if (keys.length <= MAX_WORKSPACE_RECORDS) {
         return map;
     }
     const pruned = { ...map };
-    let toRemove = keys.length - MAX_WINDOW_RECORDS;
+    let toRemove = keys.length - MAX_WORKSPACE_RECORDS;
     for (const key of keys) {
         if (toRemove <= 0) {
             break;

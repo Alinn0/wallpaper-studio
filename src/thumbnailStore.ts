@@ -11,7 +11,7 @@ import { atomicWriteTextSync } from './atomicWrite';
  * 后这份存储不保证还在，于是场景包又要重新用 WebWallGL 渲染一遍首帧、视频又要重新
  * 解码抓帧 —— 表现就是"每次打开都卡一下"。
  *
- * 这里把缩略图落到 `globalStorage/thumbnails/`：
+ * 这里把缩略图落到 `.wallpaper-studio/thumbnails/`：
  *   - 每张图一个文件（键的 md5 命名），避免每次读写整个大 JSON；
  *   - 索引记录访问时间，超过上限按 LRU 淘汰；
  *   - 总容量与条数都有上限，防止无限增长。
@@ -53,6 +53,7 @@ export class ThumbnailStore {
     private readonly indexPath: string;
     private index: ThumbnailIndex | null = null;
     private generation = 0;
+    private writeLocked = false;
 
     constructor(storageRoot: string) {
         this.dir = path.join(storageRoot, DIR_NAME);
@@ -65,7 +66,7 @@ export class ThumbnailStore {
 
     private loadIndex(): ThumbnailIndex {
         if (this.index) { return this.index; }
-        this.ensureVersion();
+        if (!this.ensureVersion()) { this.index = {}; return this.index; }
         try {
             const raw = fs.readFileSync(this.indexPath, 'utf8');
             const parsed = JSON.parse(raw);
@@ -82,11 +83,12 @@ export class ThumbnailStore {
      * 旧版本存的是原分辨率帧（单张可达 1 MB），总量会远超面板一次能接收的上限，
      * 结果就是"明明缓存了却还是要重新加载"。清空重建比逐条判断更简单可靠。
      */
-    private ensureVersion(): void {
+    private ensureVersion(): boolean {
         const versionPath = path.join(this.dir, VERSION_FILE);
         let current = '';
         try { current = fs.readFileSync(versionPath, 'utf8').trim(); } catch { /* 首次运行 */ }
-        if (current === String(STORE_VERSION)) { return; }
+        if (current === String(STORE_VERSION)) { return true; }
+        if (!this.writeLocked) { return false; }
         try {
             if (fs.existsSync(this.dir)) {
                 for (const name of fs.readdirSync(this.dir)) {
@@ -99,8 +101,10 @@ export class ThumbnailStore {
             fs.writeFileSync(versionPath, String(STORE_VERSION), 'utf8');
         } catch (error) {
             console.warn('[WallpaperStudio] Failed to reset thumbnail cache:', error);
+            throw error;
         }
         this.index = {};
+        return true;
     }
 
     private saveIndex(): void {
@@ -110,6 +114,7 @@ export class ThumbnailStore {
             atomicWriteTextSync(this.indexPath, JSON.stringify(this.index));
         } catch (error) {
             console.warn('[WallpaperStudio] Failed to write thumbnail index:', error);
+            throw error;
         }
     }
 
@@ -155,13 +160,14 @@ export class ThumbnailStore {
                 stale: 5000
             });
             if (generation !== this.generation) { return; }
+            this.writeLocked = true;
             this.index = null;
             const index = this.loadIndex();
             for (const [key, value] of batch) {
                 if (generation !== this.generation) { return; }
                 const hash = this.hashOf(key);
                 const payload = value.startsWith('data:') ? value : `data:image/jpeg;base64,${value}`;
-                await fs.promises.writeFile(this.fileOf(hash), payload, 'utf8');
+                atomicWriteTextSync(this.fileOf(hash), payload);
                 if (generation !== this.generation) {
                     await fs.promises.unlink(this.fileOf(hash)).catch(() => undefined);
                     return;
@@ -172,7 +178,9 @@ export class ThumbnailStore {
             this.saveIndex();
         } catch (error) {
             console.warn('[WallpaperStudio] Failed to store thumbnail:', error);
+            throw error;
         } finally {
+            this.writeLocked = false;
             if (release) { await release(); }
         }
     }
@@ -204,9 +212,11 @@ export class ThumbnailStore {
      * 用异步读：整份缓存可能有几 MB，同步 `readFileSync` 会把扩展宿主主线程
      * 卡住（连累所有扩展），异步反而更快完成整体启动。
      */
-    async snapshot(): Promise<Record<string, string>> {
+    async snapshot(keys?: string[]): Promise<Record<string, string>> {
+        this.index = null; // Another host may have added thumbnails since prewarm.
         const index = this.loadIndex();
-        const entries = Object.entries(index).sort((a, b) => b[1].usedAt - a[1].usedAt);
+        const entries = keys ? [...new Set(keys)].filter(key => index[key]).map(key => [key, index[key]] as const)
+            : Object.entries(index).sort((a, b) => b[1].usedAt - a[1].usedAt);
         const result: Record<string, string> = {};
         let total = 0;
         for (const [key, entry] of entries) {
@@ -226,18 +236,17 @@ export class ThumbnailStore {
         return result;
     }
 
-    clear(): void {
+    async clear(): Promise<void> {
         this.generation++;
         this.index = {};
+        await fs.promises.mkdir(this.dir, { recursive: true });
+        const release = await lockfile.lock(this.indexPath, { realpath: false, retries: { retries: 20, minTimeout: 25, maxTimeout: 250 }, stale: 30000 });
         try {
-            if (!fs.existsSync(this.dir)) { return; }
             for (const name of fs.readdirSync(this.dir)) {
-                if (name === 'index.json' || name === VERSION_FILE || FILE_NAME_RE.test(name)) {
-                    try { fs.rmSync(path.join(this.dir, name), { force: true }); } catch { /* 忽略 */ }
+                if (name === 'index.json' || name === VERSION_FILE || FILE_NAME_RE.test(name) || /^(?:index\.json|[a-f0-9]{32}\.b64)\..+\.tmp$/.test(name)) {
+                    fs.rmSync(path.join(this.dir, name), { force: true });
                 }
             }
-        } catch (error) {
-            console.warn('[WallpaperStudio] Failed to clear thumbnails:', error);
-        }
+        } finally { await release(); }
     }
 }

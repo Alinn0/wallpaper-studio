@@ -91,12 +91,12 @@ assert(
 );
 assert(
     gallerySource.includes('const total = state.wallpaperTotal > 0 ? String(state.wallpaperTotal) : \'?\''),
-    'gallery must show 0/? until the total is known'
+    'accessible progress must retain 0/? until the total is known'
 );
 assert(
-    /:description="displayLoadingDescription \|\| emptyDescription"/.test(gallerySource) ||
-    (gallerySource.includes('playlist-loading') && gallerySource.includes('{{ displayLoadingDescription }}')),
-    'gallery loading text must replace the empty-playlist description in place'
+    gallerySource.includes(':aria-label="displayLoadingDescription"') &&
+    gallerySource.includes('class="playlist-progress" role="status">{{ displayLoadingDescription }}') && !gallerySource.includes("t('wallpaperSwitchLoading')"),
+    'gallery displays playlist count outside rows and keeps wallpaper-switch loading on home'
 );
 assert(
     gallerySource.includes('playlist-loading-icon'),

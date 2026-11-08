@@ -37,6 +37,8 @@
 !node_modules/retry/{index.js,package.json,License}
 !node_modules/retry/lib/*.js
 !node_modules/signal-exit/{index.js,signals.js,package.json,LICENSE.txt}
+!node_modules/ws/{index.js,package.json,LICENSE}
+!node_modules/ws/lib/*.js
 
 # Scene renderer reads the browser bundle and resolves webwallgl/package.json.
 # mediabunny is already bundled; ESM, types, images and examples are not loaded.

@@ -70,6 +70,7 @@ SOFTWARE.
 |---|---|---|
 | `fs-extra` | MIT | 文件读写 |
 | `proper-lockfile` | MIT | 内核文件打补丁时加锁 |
+| `ws` | MIT | 本机只读缓存字节传输 |
 | `async-mutex` | MIT | 串行化渲染任务 |
 | `@vscode/sudo-prompt` | MIT | macOS / Linux 提权写内核文件 |
 

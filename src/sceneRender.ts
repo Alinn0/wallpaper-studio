@@ -13,6 +13,9 @@ export interface SceneRenderConfig {
     opacity: number;
     blur: number;
     blendMode: string;
+    targetFps?: number;
+    maxFps?: number;
+    receipt?: string;
 }
 
 export function createSceneRenderConfig(input: SceneRenderConfig): SceneRenderConfig {
@@ -23,6 +26,9 @@ export function createSceneRenderConfig(input: SceneRenderConfig): SceneRenderCo
         properties: { ...input.properties },
         opacity: input.opacity,
         blur: input.blur,
-        blendMode: input.blendMode
+        blendMode: input.blendMode,
+        ...(input.targetFps === undefined ? {} : { targetFps: input.targetFps }),
+        ...(input.maxFps === undefined ? {} : { maxFps: input.maxFps }),
+        ...(input.receipt ? { receipt: input.receipt } : {})
     };
 }

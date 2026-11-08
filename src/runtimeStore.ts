@@ -4,6 +4,7 @@ import * as path from 'path';
 import { getContext } from './global';
 import * as lockfile from 'proper-lockfile';
 import { atomicWriteTextSync } from './atomicWrite';
+import { createEvent } from './events';
 
 export const RUNTIME_FILE = path.join(process.env.WALLPAPER_STUDIO_DATA_DIR || path.join(os.homedir(), '.wallpaper-studio'), 'runtime.json');
 
@@ -11,24 +12,25 @@ export interface RuntimeState {
     version: number;
     workspacePaths: Record<string, string>;
     workspaceImages: Record<string, string>;
-    windowOpacity: Record<string, number>;
-    workspaceOpacity: Record<string, number>;
-    windowBlur: Record<string, number>;
-    workspaceBlur: Record<string, number>;
+    workspacePreviousImages: Record<string, string>;
+    workspacePinnedImages: Record<string, string>;
+    workspaceStagedImages: Record<string, string>;
 }
 
 const DEFAULT_RUNTIME: RuntimeState = {
     version: 1,
     workspacePaths: {},
     workspaceImages: {},
-    windowOpacity: {},
-    workspaceOpacity: {},
-    windowBlur: {},
-    workspaceBlur: {}
+    workspacePreviousImages: {},
+    workspacePinnedImages: {},
+    workspaceStagedImages: {},
 };
 
 let cache: RuntimeState | null = null;
 let migrationChecked = false;
+const runtimeChanges = createEvent<{ external: boolean }>();
+export const onDidChangeRuntime = runtimeChanges.event;
+let lastRuntimeText = '';
 
 function isRecord(value: unknown): value is Record<string, unknown> {
     return typeof value === 'object' && value !== null && !Array.isArray(value);
@@ -41,23 +43,15 @@ function stringMap(value: unknown): Record<string, string> {
     ) as Record<string, string>;
 }
 
-function numberMap(value: unknown): Record<string, number> {
-    if (!isRecord(value)) { return {}; }
-    return Object.fromEntries(
-        Object.entries(value).filter(([, item]) => typeof item === 'number' && Number.isFinite(item))
-    ) as Record<string, number>;
-}
-
 function normalize(value: unknown): RuntimeState {
     const source = isRecord(value) ? value : {};
     return {
         version: 1,
         workspacePaths: stringMap(source.workspacePaths),
         workspaceImages: stringMap(source.workspaceImages),
-        windowOpacity: numberMap(source.windowOpacity),
-        workspaceOpacity: numberMap(source.workspaceOpacity),
-        windowBlur: numberMap(source.windowBlur),
-        workspaceBlur: numberMap(source.workspaceBlur)
+        workspacePreviousImages: stringMap(source.workspacePreviousImages),
+        workspacePinnedImages: stringMap(source.workspacePinnedImages),
+        workspaceStagedImages: stringMap(source.workspaceStagedImages),
     };
 }
 
@@ -74,10 +68,6 @@ function readLegacyState(): RuntimeState {
     return normalize({
         workspaceImages: globalState.get<Record<string, string>>('wallpaperStudio.workspaceImages', {}),
         workspacePaths: globalState.get<Record<string, string>>('wallpaperStudio.workspacePaths', {}),
-        windowOpacity: globalState.get<Record<string, number>>('wallpaperStudio.windowOpacity', {}),
-        workspaceOpacity: globalState.get<Record<string, number>>('wallpaperStudio.workspaceOpacity', {}),
-        windowBlur: globalState.get<Record<string, number>>('wallpaperStudio.windowBlur', {}),
-        workspaceBlur: globalState.get<Record<string, number>>('wallpaperStudio.workspaceBlur', {})
     });
 }
 
@@ -133,6 +123,8 @@ export async function updateRuntimeState(mutator: (state: RuntimeState) => void)
             mutator(latest);
             if (!persist(latest)) { return false; }
             cache = latest;
+            lastRuntimeText = JSON.stringify(latest);
+            runtimeChanges.fire({ external: false });
             return true;
         } finally {
             await release();
@@ -149,10 +141,35 @@ export async function clearRuntimeState(): Promise<boolean> {
     });
 }
 
+export function startRuntimeSync(): { dispose(): void } {
+    lastRuntimeText = JSON.stringify(readRuntimeState());
+    const listener = () => {
+        const disk = readDisk();
+        if (!disk) { return; }
+        const text = JSON.stringify(disk);
+        if (text === lastRuntimeText) { return; }
+        lastRuntimeText = text;
+        cache = disk;
+        runtimeChanges.fire({ external: true });
+    };
+    fs.watchFile(RUNTIME_FILE, { interval: 500, persistent: false }, listener);
+    return { dispose: () => fs.unwatchFile(RUNTIME_FILE, listener) };
+}
+
 /** Remove records written by versions that used global/session-scoped images. */
 export async function clearLegacyImageRecords(): Promise<void> {
     const state = getContext().globalState;
     for (const key of [
+        'wallpaperStudioRecentImages',
+        'wallpaperStudioDefaultModeWallpaper',
+        'wallpaperStudioWallpaperEnabled',
+        'wallpaperStudioOnlineFolder',
+        'wallpaperStudioOnlineImageList',
+        'wallpaperStudioSingleImageSource',
+        'wallpaperStudio.windowOpacity',
+        'wallpaperStudio.workspaceOpacity',
+        'wallpaperStudio.windowBlur',
+        'wallpaperStudio.workspaceBlur',
         'wallpaperStudio.globalImage',
         'wallpaperStudio.windowImages',
         'wallpaperStudio.workspaceImages'
@@ -173,6 +190,9 @@ export async function pruneOrphanedWorkspaceRecords(): Promise<void> {
         for (const key of Object.keys(runtime.workspaceImages)) {
             if (key !== 'no-workspace' && !Object.prototype.hasOwnProperty.call(runtime.workspacePaths, key)) {
                 delete runtime.workspaceImages[key];
+                delete runtime.workspacePreviousImages[key];
+                delete runtime.workspacePinnedImages[key];
+                delete runtime.workspaceStagedImages[key];
             }
         }
     });

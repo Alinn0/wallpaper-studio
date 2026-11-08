@@ -138,6 +138,7 @@ function check(label, condition, detail) {
 function reset() {
     globalState.clear();
     globalState.set('wallpaperStudioWallpaperConfig', configPath);
+    globalState.set('wallpaperStudioLocalFiles', [standaloneFile]);
     globalState.set('wallpaperStudioRecentImages', [standaloneFile, sceneA, sceneB, folderFileA]);
 }
 
@@ -170,6 +171,9 @@ check(
 
 reset();
 globalState.set('wallpaperStudioSourceMode', 'file');
+globalState.delete('wallpaperStudioLocalFiles');
+check('旧播放历史不会变成本地文件', sourceMode.getCandidatesForMode().length === 0);
+globalState.set('wallpaperStudioLocalFiles', [standaloneFile]);
 const fileCandidates = sourceMode.getCandidatesForMode();
 check(
     'file 模式只返回单独导入的文件',
@@ -252,14 +256,14 @@ check(
     names(sourceMode.getCandidatesForMode()).join(',') === 'scene-a.pkg,scene-b.pkg'
 );
 
-// 历史键随模式同步
+// 来源模式是唯一真源，不再写重复标记
 reset();
-globalState.set('wallpaperStudioWallpaperEnabled', true);
+globalState.delete('wallpaperStudioWallpaperEnabled');
 sourceMode.setSourceMode('folder').then(() => {
-    check('切到 folder 时同步关闭播放列表标记', globalState.get('wallpaperStudioWallpaperEnabled') === false);
+    check('切到 folder 只更新来源模式', sourceMode.getSourceMode() === 'folder' && !globalState.has('wallpaperStudioWallpaperEnabled'));
     return sourceMode.setSourceMode('wallpaper');
 }).then(() => {
-    check('切回 wallpaper 时同步开启播放列表标记', globalState.get('wallpaperStudioWallpaperEnabled') === true);
+    check('切回 wallpaper 不生成旧标记', sourceMode.getSourceMode() === 'wallpaper' && !globalState.has('wallpaperStudioWallpaperEnabled'));
     fs.rmSync(tempRoot, { recursive: true, force: true });
     if (failures) {
         console.error(`${failures} test(s) failed`);

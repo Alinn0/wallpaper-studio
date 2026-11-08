@@ -298,6 +298,75 @@ async function scenario(label, run) {
 }
 
 (async () => {
+
+    resetFixture();
+    const home = new StudioViewProvider(context);
+    home.view = makeView();
+    const windowState = require('../out/windowBackground');
+    const sceneDirectory = path.join(tempRoot, 'home-title-scene');
+    const videoDirectory = path.join(tempRoot, 'home-title-video');
+    fs.mkdirSync(sceneDirectory);
+    fs.mkdirSync(videoDirectory);
+    const scenePath = path.join(sceneDirectory, 'scene.pkg');
+    const videoPath = path.join(videoDirectory, 'wallpaper.mp4');
+    const sceneProject = path.join(sceneDirectory, 'project.json');
+    fs.writeFileSync(scenePath, 'x');
+    fs.writeFileSync(videoPath, 'x');
+    fs.writeFileSync(sceneProject, JSON.stringify({ title: '<b>Forest</b> &nbsp; Night', type: 'scene' }));
+    fs.writeFileSync(path.join(videoDirectory, 'project.json'), JSON.stringify({ title: 'Ocean Waves', type: 'video', file: 'wallpaper.mp4' }));
+    async function homeConfig(mediaPath) {
+        await windowState.setCurrentImagePath(mediaPath, { persist: false });
+        posted.length = 0;
+        home.pushState(false);
+        return posted.find(entry => entry.message.type === 'state').message.data.config;
+    }
+    const firstHome = await homeConfig(scenePath);
+    assert.equal(firstHome.imagePathLabel, 'Forest Night', 'home before gallery load must use project title, even without project properties');
+    assert.equal(firstHome.sceneRender.title, 'Forest Night', 'scene preview must receive the same title');
+    const selection = require('../out/backgroundSelection');
+    posted.length = 0;
+    const nextSelection = selection.beginBackgroundSelection(videoPath, windowState.getWorkspaceKey());
+    const pendingMessage = posted.find(entry => entry.message.type === 'state').message;
+    assert.equal(pendingMessage.data.config.imagePath, videoPath, 'home and playlist selection update before background preparation');
+    assert.equal(pendingMessage.data.config.imageLoading, true);
+    assert.equal(pendingMessage.data.config.imagePathLabel, 'Ocean Waves');
+    assert.equal(windowState.resolveCurrentImagePath(), scenePath, 'pending selection never changes the applied path');
+    assert.ok(!Object.hasOwn(pendingMessage.data.state, 'wallpaperPlaylist'), 'selection updates retain the loaded playlist and its scroll position');
+    assert.equal(selection.getPendingBackgroundSelection('another-workspace'), undefined);
+    posted.length = 0;
+    nextSelection.finish();
+    const reverted = posted.find(entry => entry.message.type === 'state').message.data.config;
+    assert.equal(reverted.imagePath, scenePath);
+    assert.equal(reverted.imageLoading, false);
+    assert.equal((await homeConfig(videoPath)).imagePathLabel, 'Ocean Waves', 'video title must not fall back to media filename');
+    assert.equal((await homeConfig(scenePath)).imagePathLabel, 'Forest Night', 'switching wallpaper must not retain the previous title');
+    const originalReadFile = fs.readFileSync;
+    let repeatedProjectReads = 0;
+    fs.readFileSync = function (filePath, ...args) {
+        if (String(filePath) === sceneProject) { repeatedProjectReads++; }
+        return originalReadFile.call(fs, filePath, ...args);
+    };
+    try { for (let i = 0; i < 10; i++) { home.pushState(false); } }
+    finally { fs.readFileSync = originalReadFile; }
+    assert.equal(repeatedProjectReads, 0, 'repeated state pushes reuse cached current-project metadata');
+    fs.writeFileSync(sceneProject, JSON.stringify({ title: 'Updated Forest', type: 'scene' }));
+    engine.clearWallpaperProjectCache();
+    home.wallpaperEntries = [{ path: scenePath, title: 'Stale playlist title' }];
+    assert.equal((await homeConfig(scenePath)).imagePathLabel, 'Updated Forest', 'reread project title wins over stale playlist metadata');
+    fs.writeFileSync(sceneProject, '{}');
+    engine.clearWallpaperProjectCache();
+    const equivalentPath = process.platform === 'win32' ? scenePath.toUpperCase().replace(/\\/g, '/') : path.join(sceneDirectory, 'unused') + '/../scene.pkg';
+    home.wallpaperEntries = [{ path: equivalentPath, title: 'Cached Wallpaper Title' }];
+    assert.equal((await homeConfig(scenePath)).imagePathLabel, 'Cached Wallpaper Title', 'equivalent paths must match the loaded entry');
+    home.wallpaperEntries = [];
+    assert.equal((await homeConfig(scenePath)).imagePathLabel, 'scene.pkg', 'missing title falls back only when both title sources are unavailable');
+    fs.writeFileSync(sceneProject, '{broken');
+    engine.clearWallpaperProjectCache();
+    assert.equal((await homeConfig(scenePath)).imagePathLabel, 'scene.pkg', 'unreadable metadata must not break state pushes');
+    assert.equal((await homeConfig('')).imagePathLabel, '', 'clearing wallpaper clears its title');
+    assert.equal(playlistReads, 0, 'home title lookup must never scan the playlist');
+    console.log('PASS home title without gallery, scene/video switching, metadata cache, path aliases and fallbacks');
+
     // 首页和 ready 均不读取列表，首次进入列表才扫描。
     const logA = await scenario('A 列表页按需加载', async provider => {
         provider.resolveWebviewView(makeView(), {}, { cancellationToken: {} });

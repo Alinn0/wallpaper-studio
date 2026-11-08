@@ -67,17 +67,17 @@ async function main() {
         const measuredFs = { ...fs, createReadStream(...args) { streams++; return fs.createReadStream(...args); } };
         const cold = loadCjs('out/wallpaperScene.js', { fs: measuredFs });
         const target = await cold.copyWallpaperScenePackage(source, assets);
-        assert.equal(streams, 1);
+        assert.equal(streams, 2, 'hash original and verify copied bytes once on a cold cache');
         const warm = loadCjs('out/wallpaperScene.js', { fs: measuredFs });
         assert.equal(await warm.copyWallpaperScenePackage(source, assets), target);
-        assert.equal(streams, 1, 'new process module should reuse persisted source hash');
+        assert.equal(streams, 2, 'new process module should reuse persisted source hash');
         const first = await warm.buildWallpaperScenePage(path.resolve('.'));
         const second = await warm.buildWallpaperScenePage(path.resolve('.'));
         assert.equal(first, second, 'HTML/base64 and patched runtime are reused');
         fs.writeFileSync(source, Buffer.alloc(8192, 7));
         assert.notEqual(await warm.copyWallpaperScenePackage(source, assets), target);
-        assert.equal(streams, 2);
-        console.log('PASS cold hash reads=1, warm hash reads=0; source changes invalidate; runtime HTML memoized');
+        assert.equal(streams, 4);
+        console.log('PASS cold copy verified, warm hash reads=0; source changes invalidate; runtime HTML memoized');
     }
     {
         const { SCENE_CONTINUITY_JS } = require('../out/sceneContinuity');
@@ -100,7 +100,8 @@ async function main() {
         box.clearWallpaperPoster(target);
         assert.equal(nodes.length, 0);
         for (let i = 0; i < 15; i++) box.saveWallpaperPoster(target, `workspace-${i}.css`, config, poster);
-        assert.ok(records.size <= 8);
+        assert.ok(target.__wallpaperStudioPosters.length <= 8);
+        assert.equal(records.size, 0, 'poster cache must never persist in the browser profile');
         for (let i = 0; i < 100; i++) box.recordWallpaperTiming(target, 'test', i);
         assert.equal(target.__wallpaperStudioPerformance.samples.length, 80);
         console.log('PASS workspace poster identity, bounded storage and timing samples');
@@ -121,7 +122,7 @@ async function main() {
             WebWallGL: { bytesSource: () => ({}), mount: async (host, options) => {
                 active++; maximum = Math.max(maximum, active); events.push('mount'); mounts.push(options);
                 let destroyed = false;
-                return { setFps() {}, setCoverAlign() {}, setFit() {}, pushPointer() {}, setProperties() {},
+                return { setFps(value) { events.push('fps:' + value); }, setCoverAlign() {}, setFit() {}, pushPointer() {}, setProperties() {},
                     pause() { events.push('pause'); }, resume() { events.push('resume'); },
                     destroy() { if (!destroyed) { destroyed = true; active--; events.push('destroy'); } } };
             } }
@@ -133,11 +134,19 @@ async function main() {
             send({ type: 'load', token: 'first', bytes: new ArrayBuffer(2), key: 'A' });
             await waitFor(() => messages.some(message => message.type === 'scene-ready' && message.token === 'first'));
             events.length = 0;
-            send({ type: 'load', token: 'second', bytes: new ArrayBuffer(2), key: 'B' });
+            send({ type: 'load', token: 'second', bytes: new ArrayBuffer(2), key: 'B', targetFps: 240, maxFps: 144 });
             await waitFor(() => messages.some(message => message.type === 'scene-ready' && message.token === 'second'));
             assert.ok(events.indexOf('poster-added') < events.indexOf('destroy'), 'old frame must be covered before destruction');
             assert.equal(maximum, 1, 'no overlapping live GPU scenes');
             assert.equal(mounts[0].fps, 60);
+            assert.equal(mounts[1].fps, 144, 'scene uses the persisted maximum without sampling');
+            send({ type: 'set-properties', properties: {}, targetFps: 240, maxFps: 165 });
+            assert.ok(events.includes('fps:165'), 'manual re-read hot-updates the active scene cap');
+            assert.equal(handlers.resize, undefined, 'resizing does not sample again');
+            send({ type: 'set-properties', properties: {}, targetFps: 20 });
+            assert.ok(events.includes('fps:20')); assert.equal(mounts.length, 2);
+            send({ type: 'set-properties', properties: {}, targetFps: 1 });
+            assert.ok(events.includes('fps:15'));
             document.hidden = true; documentHandlers.visibilitychange(); assert.ok(events.includes('pause'));
             document.hidden = false; documentHandlers.visibilitychange(); assert.ok(events.includes('resume'));
             assert.ok(messages.find(message => message.token === 'second' && message.type === 'scene-ready').mountMs >= 0);
@@ -246,7 +255,8 @@ async function main() {
         const output = ts.transpileModule(source, { compilerOptions: { target: ts.ScriptTarget.ES2020, module: ts.ModuleKind.CommonJS } }).outputText;
         const runtime = loadCjs('webview/src/composables/useScenePreview.ts', {
             vue: { reactive: value => value }, './useBridge': { useBridge: () => bridge },
-            './useThumbnailCache': { getThumbnail: key => thumbnails.get(key) || '', setThumbnail: (key, value) => thumbnails.set(key, value) }
+            './useThumbnailCache': { getThumbnail: key => thumbnails.get(key) || '', setThumbnail: (key, value) => thumbnails.set(key, value),
+                ensureThumbnails: async () => {}, thumbnailCacheStats: { sceneRenders: 0 } }
         }, { window, document, fetch, AbortController }, output);
         try {
             const preview = runtime.useScenePreview();
@@ -266,7 +276,7 @@ async function main() {
     {
         const vue = require('../webview/node_modules/vue');
         const state = vue.reactive({ sourceMode: 'file', wallpaperPlaylist: [], folderImages: [],
-            recentImages: Array.from({ length: 10000 }, (_, i) => ({ path: 'a-' + i + '.png', name: 'image ' + i, display: '' })) });
+            localFiles: Array.from({ length: 10000 }, (_, i) => ({ path: 'a-' + i + '.png', name: 'image ' + i, display: '' })) });
         const config = vue.reactive({ imagePath: '' });
         const source = fs.readFileSync('webview/src/views/LocalGalleryTab.vue', 'utf8').split('<script setup lang="ts">')[1].split('</script>')[0] +
             '\nexport { visibleWallpapers, scrollTop, viewportHeight, windowStart };';
@@ -278,16 +288,17 @@ async function main() {
                 '../composables/useI18n': { useI18n: () => ({ t: key => key }) },
                 '../composables/useBridge': { useBridge: () => ({ post() {} }) },
                 '../composables/useScenePreview': { useScenePreview: () => ({ cancelQueuedExcept() {}, previewOf: () => '' }) },
+                '../../../src/mediaTypes': require('../out/mediaTypes'),
                 '../composables/useStore': { config, state }, '../constants': { ActionType: {} },
                 '../utils/media': { isVideoPath: () => false, isWallpaperPkgPath: () => false },
-                '../composables/useThumbnailCache': { getThumbnail: () => '', setThumbnail() {} }
+                '../composables/useThumbnailCache': { getThumbnail: () => '', setThumbnail() {}, thumbnailView: () => ({}), ensureThumbnails: async () => {} }
             }, { document: { querySelectorAll: () => [] } }, output));
             assert.equal(view.visibleWallpapers.value.length, 16);
             view.scrollTop.value = 6000;
             assert.equal(view.windowStart.value, 96);
             assert.equal(view.visibleWallpapers.value[0].path, 'a-96.png');
             assert.equal(view.visibleWallpapers.value.length, 16);
-            state.recentImages = [];
+            state.localFiles = [];
             await vue.nextTick();
             assert.equal(view.scrollTop.value, 0);
             assert.equal(view.visibleWallpapers.value.length, 0);
@@ -297,8 +308,9 @@ async function main() {
     {
         const posts = [], values = { opacity: 0.4, blur: 8 };
         const { StudioViewProvider } = loadCjs('out/StudioViewProvider.js', {
+            './sharedLibrary': { getLibraryError: () => '' },
             vscode: {}, './PickList': {}, './global': {}, './windowBackground': {
-                resolveCurrentImagePath: () => '', resolveCurrentOpacity: value => value, resolveCurrentBlur: value => value },
+                getWorkspaceKey: () => 'performance', getPinnedImagePath: () => '', resolveCurrentImagePath: () => '', resolveCurrentOpacity: value => value, resolveCurrentBlur: value => value },
             './settingsStore': { getAppConfig: () => ({ get: (key, fallback) => values[key] ?? fallback }) },
             './sourceMode': { normalizeSourceMode: value => value }, './thumbnailStore': {}, './scenePreview': {}, './runtimeStore': {},
             './wallpaperEngine': { hasWallpaperConfig: () => false, getWallpaperProjectProperties: () => [],
@@ -311,9 +323,28 @@ async function main() {
         assert.equal(posts[0].data.config.opacity, 0.4); assert.equal(posts[0].data.state, undefined);
         provider.pushState(false);
         assert.ok(!Object.hasOwn(posts[1].data.state, 'wallpaperPlaylist'));
-        assert.ok(!Object.hasOwn(posts[1].data.state, 'recentImages'));
+        assert.ok(!Object.hasOwn(posts[1].data.state, 'localFiles'));
         console.log('PASS appearance/current-scene updates omit unchanged gallery arrays');
     }
+
+    {
+        const source = fs.readFileSync('webview/src/views/HomeTab.vue', 'utf8');
+        const posts = [];
+        const config = { targetFps: 60 };
+        const code = source.match(/function onTargetFpsChange\([^]*?\n}/)[0] + '\nexport { onTargetFpsChange };';
+        const output = ts.transpileModule(code, { compilerOptions: { target: ts.ScriptTarget.ES2020, module: ts.ModuleKind.CommonJS } }).outputText;
+        const home = loadCjs('webview/src/views/HomeTab.vue', {}, {
+            refreshLimit: { value: 144 }, config, bridge: { post: value => posts.push(value) }
+        }, output);
+        home.onTargetFpsChange(999);
+        assert.equal(config.targetFps, 144); assert.equal(posts.at(-1).value, 144);
+        home.onTargetFpsChange(1); assert.equal(posts.at(-1).value, 15);
+        const count = posts.length;
+        home.onTargetFpsChange(undefined); home.onTargetFpsChange(NaN);
+        assert.equal(posts.length, count);
+        console.log('PASS homepage clamps target input to the shared 15–144 limit');
+    }
+
     console.log('Performance continuity checks passed.');
 }
 main().catch(error => { console.error(error); process.exitCode = 1; });
