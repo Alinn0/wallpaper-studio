@@ -96,6 +96,7 @@ async function main() {
         '../composables/useStore': { config: {}, state: { sourceMode: 'wallpaper', wallpaperLoading: true, wallpaperLoaded: 7, wallpaperTotal: 12 } },
         '../constants': { ActionType: {} }, '../utils/media': { isVideoPath: key => key.includes('.mp4'), isWallpaperPkgPath: () => false },
         '../composables/useThumbnailCache': { thumbnailView: () => ({}), setThumbnail: (...args) => videoWrites.push(args) },
+        '../composables/useProjectCover': { getProjectCover: () => '', projectCoverKey: source => 'project-cover:' + source },
         '../../../src/mediaTypes': {}
     }, ts.transpileModule(script + '\nexport { registerVideoThumb, captureVideoFrame, displayLoadingDescription };', {
         compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2020 }

@@ -502,6 +502,13 @@ export function getWallpaperProjectTitle(filePath: string): string {
     return getProjectInfo(resolveWallpaperMediaPath(filePath)).projectTitle || '';
 }
 
+/** Current artwork lookup reuses metadata without scanning the playlist. */
+export function getWallpaperProjectPreview(filePath: string): string {
+    if (!filePath || /^(https?|data):/i.test(filePath)) { return ''; }
+    const preview = getProjectInfo(resolveWallpaperMediaPath(filePath)).preview;
+    return /\.(gif|jpe?g|png|webp)$/i.test(preview) && fs.existsSync(preview) ? preview : '';
+}
+
 export function getWallpaperProjectProperties(filePath: string): WallpaperProperty[] {
     if (!filePath || /^(https?|data):/i.test(filePath)) { return []; }
     return getProjectInfo(resolveWallpaperMediaPath(filePath)).properties;

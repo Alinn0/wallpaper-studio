@@ -312,7 +312,7 @@ async function scenario(label, run) {
     const sceneProject = path.join(sceneDirectory, 'project.json');
     fs.writeFileSync(scenePath, 'x');
     fs.writeFileSync(videoPath, 'x');
-    fs.writeFileSync(sceneProject, JSON.stringify({ title: '<b>Forest</b> &nbsp; Night', type: 'scene' }));
+    fs.writeFileSync(sceneProject, JSON.stringify({ title: '<b>Forest</b> &nbsp; Night', type: 'scene', preview: 'preview.gif' }));
     fs.writeFileSync(path.join(videoDirectory, 'project.json'), JSON.stringify({ title: 'Ocean Waves', type: 'video', file: 'wallpaper.mp4' }));
     async function homeConfig(mediaPath) {
         await windowState.setCurrentImagePath(mediaPath, { persist: false });
@@ -320,7 +320,11 @@ async function scenario(label, run) {
         home.pushState(false);
         return posted.find(entry => entry.message.type === 'state').message.data.config;
     }
+    fs.writeFileSync(path.join(sceneDirectory, 'preview.gif'), 'GIF89a');
     const firstHome = await homeConfig(scenePath);
+    assert.match(firstHome.imageProjectPreview, /preview\.gif\?v=/, 'home receives signed artwork URI without loading the playlist');
+    assert.equal((await homeConfig(videoPath)).imageProjectPreview, '', 'switching to a project without artwork clears the previous cover');
+    await homeConfig(scenePath);
     assert.equal(firstHome.imagePathLabel, 'Forest Night', 'home before gallery load must use project title, even without project properties');
     assert.equal(firstHome.sceneRender.title, 'Forest Night', 'scene preview must receive the same title');
     const selection = require('../out/backgroundSelection');

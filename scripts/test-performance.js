@@ -288,6 +288,7 @@ async function main() {
                 '../composables/useI18n': { useI18n: () => ({ t: key => key }) },
                 '../composables/useBridge': { useBridge: () => ({ post() {} }) },
                 '../composables/useScenePreview': { useScenePreview: () => ({ cancelQueuedExcept() {}, previewOf: () => '' }) },
+                '../composables/useProjectCover': { getProjectCover: () => '', projectCoverKey: source => 'project-cover:' + source },
                 '../../../src/mediaTypes': require('../out/mediaTypes'),
                 '../composables/useStore': { config, state }, '../constants': { ActionType: {} },
                 '../utils/media': { isVideoPath: () => false, isWallpaperPkgPath: () => false },

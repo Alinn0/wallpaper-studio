@@ -140,7 +140,7 @@
     "@vscode/sudo-prompt": "^9.3.2",
     "fs-extra": "^11.2.0",
     "proper-lockfile": "^4.1.2",
-    "webwallgl": "^3.0.0",
+    "webwallgl": "^3.0.2",
     "ws": "^8.22.1"
   }
 }

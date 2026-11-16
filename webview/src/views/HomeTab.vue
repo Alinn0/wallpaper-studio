@@ -9,7 +9,7 @@
                     :alt="t('previewAlt')"
                 />
                 <video
-                    v-else-if="displayUrl && isVideo && !isThumbnailGenerating && isThumbnailReady(mediaThumbnailKey)"
+                    v-else-if="!useProjectCover && displayUrl && isVideo && !isThumbnailGenerating && isThumbnailReady(mediaThumbnailKey)"
                     class="thumbnail-source"
                     :src="displayUrl"
                     muted
@@ -19,7 +19,7 @@
                     @canplay="captureVideoThumb"
                 />
                 <img
-                    v-else-if="displayUrl && !isVideo && !isWallpaperPkg && isThumbnailReady(mediaThumbnailKey)"
+                    v-else-if="!useProjectCover && displayUrl && !isVideo && !isWallpaperPkg && isThumbnailReady(mediaThumbnailKey)"
                     class="thumbnail-source"
                     :src="displayUrl"
                     alt=""
@@ -146,6 +146,7 @@ import { Picture, ArrowLeft, RefreshRight, Setting } from '@element-plus/icons-v
 import { useI18n } from '../composables/useI18n';
 import { useBridge } from '../composables/useBridge';
 import { useScenePreview } from '../composables/useScenePreview';
+import { getProjectCover, projectCoverKey, requestProjectCover } from '../composables/useProjectCover';
 import { useDisplayFps } from '../composables/useDisplayFps';
 import { getThumbnail, setThumbnail, thumbnailRevision, ensureThumbnails, isThumbnailReady, setCurrentPreviewKeys } from '../composables/useThumbnailCache';
 import { config, state, type WallpaperProperty } from '../composables/useStore';
@@ -188,6 +189,10 @@ const selectedMode = computed({
 
 // 只用扩展侧给出的本地路径。在线地址一律不直连，避免每次刷新都回源云存储。
 const displayUrl = computed(() => config.imagePathDisplay || '');
+const projectCoverSource = computed(() => state.sourceMode === 'wallpaper' ? config.imageProjectPreview || '' : '');
+const failedProjectCover = ref('');
+const useProjectCover = computed(() => !!projectCoverSource.value && failedProjectCover.value !== projectCoverSource.value);
+let coverController: AbortController | undefined;
 const mediaThumbnailKey = computed(() => `${isVideoPath(config.imagePath) ? 'video' : 'image'}:${displayUrl.value}`);
 
 const isWallpaperPkg = computed(() => isWallpaperPkgPath(config.imagePath));
@@ -307,11 +312,12 @@ function canvasToThumbnail(context: CanvasRenderingContext2D, source: CanvasImag
     return canvas.toDataURL('image/jpeg', 0.8);
 }
 
-/** 首页优先显示缓存；缓存未命中时只生成一次缩略图，不显示实时媒体。 */
+/** Wallpaper 首页优先作品封面（GIF 保留动画），不可用时复用原媒体首帧。 */
 const previewThumbnail = computed(() => {
     void thumbnailRevision.value;
     const path = config.imagePath;
     if (!path) { return ''; }
+    if (useProjectCover.value) { return getProjectCover(projectCoverSource.value); }
     if (isWallpaperPkg.value) {
         return scenePreview.previewOf(config.imagePathDisplay, config.sceneRender?.properties);
     }
@@ -320,26 +326,37 @@ const previewThumbnail = computed(() => {
 
 let scenePreviewTimer: ReturnType<typeof setTimeout> | undefined;
 let previewGeneration = 0;
-function scheduleCurrentPreview() {
+async function scheduleCurrentPreview() {
     const generation = ++previewGeneration;
-    const keys = isWallpaperPkg.value ? scenePreview.cacheKeys(displayUrl.value, config.sceneRender?.properties) : [mediaThumbnailKey.value];
-    setCurrentPreviewKeys(displayUrl.value ? keys : []);
+    coverController?.abort();
+    coverController = undefined;
     isThumbnailGenerating.value = false;
     if (scenePreviewTimer) { clearTimeout(scenePreviewTimer); }
     scenePreview.cancelPriority();
+    const source = projectCoverSource.value;
+    const keys = isWallpaperPkg.value ? scenePreview.cacheKeys(displayUrl.value, config.sceneRender?.properties) : [mediaThumbnailKey.value];
+    setCurrentPreviewKeys(displayUrl.value ? (useProjectCover.value ? [projectCoverKey(source)] : keys) : []);
     if (document.hidden || !displayUrl.value) { return; }
-    void ensureThumbnails(keys).then(() => {
-        if (generation !== previewGeneration || document.hidden || !isWallpaperPkg.value) { return; }
-        scenePreviewTimer = setTimeout(() => {
-            scenePreviewTimer = undefined;
-            isThumbnailGenerating.value = true;
-            void scenePreview.requestPreview(displayUrl.value, true, config.sceneRender).finally(() => {
-                if (generation === previewGeneration) { isThumbnailGenerating.value = false; }
-            });
-        }, 250);
-    });
+    if (useProjectCover.value) {
+        const controller = new AbortController();
+        coverController = controller;
+        const cover = await requestProjectCover(source, controller.signal);
+        if (controller.signal.aborted || generation !== previewGeneration) { return; }
+        if (cover) { return; }
+        failedProjectCover.value = source;
+        setCurrentPreviewKeys(keys);
+    }
+    await ensureThumbnails(keys);
+    if (generation !== previewGeneration || document.hidden || !isWallpaperPkg.value) { return; }
+    scenePreviewTimer = setTimeout(() => {
+        scenePreviewTimer = undefined;
+        isThumbnailGenerating.value = true;
+        void scenePreview.requestPreview(displayUrl.value, true, config.sceneRender).finally(() => {
+            if (generation === previewGeneration) { isThumbnailGenerating.value = false; }
+        });
+    }, 250);
 }
-watch([currentKey, displayUrl, () => JSON.stringify(config.sceneRender?.properties || {})], scheduleCurrentPreview, { immediate: true });
+watch([currentKey, displayUrl, projectCoverSource, () => JSON.stringify(config.sceneRender?.properties || {})], scheduleCurrentPreview, { immediate: true });
 onMounted(() => { document.addEventListener('visibilitychange', scheduleCurrentPreview); });
 
 const shortPath = computed(() => {
@@ -463,6 +480,7 @@ function onViewOffsetInput() {
 }
 onUnmounted(() => {
     previewGeneration++;
+    coverController?.abort();
     setCurrentPreviewKeys([]);
     document.removeEventListener('visibilitychange', scheduleCurrentPreview);
     if (scenePreviewTimer) { clearTimeout(scenePreviewTimer); }

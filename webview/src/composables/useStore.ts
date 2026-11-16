@@ -15,6 +15,7 @@ export interface StudioConfig {
     imageLoading: boolean;
     imagePathDisplay: string;     // webview URI for <img src>
     imagePathLabel: string;
+    imageProjectPreview: string;
     pinnedImagePath: string;
     /** 当前背景（三种来源通用）的完整 Wallpaper Engine 配置项 */
     imageProperties: WallpaperProperty[];
@@ -87,6 +88,7 @@ export const config = reactive<StudioConfig>({
     imageLoading: false,
     imagePathDisplay: '',
     imagePathLabel: '',
+    imageProjectPreview: '',
     pinnedImagePath: '',
     imageProperties: [],
     imageProject: undefined,

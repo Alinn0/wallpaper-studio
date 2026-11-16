@@ -46,9 +46,13 @@
             </div>
             <div ref="listElement" class="wallpaper-list" @scroll="onListScroll">
                 <div :style="{ height: Math.max(0, displayWallpapers.length * ROW_HEIGHT - 6) + 'px', position: 'relative', flexShrink: 0 }">
-                <div v-for="(wallpaper, index) in visibleWallpapers" :key="wallpaper.path" class="wallpaper-row" :style="{ position: 'absolute', top: (windowStart + index) * ROW_HEIGHT + 'px', left: 0, right: 0 }" :class="{ 'is-current': wallpaper.path === config.imagePath }" :data-pkg="sceneKey(wallpaper)" :ref="registerThumb" @click="onSelectWallpaper(wallpaper)" @mouseenter="onPkgHover(sceneKey(wallpaper))" @contextmenu.prevent="onRowContextMenu($event, wallpaper.path)">
+                <div v-for="(wallpaper, index) in visibleWallpapers" :key="wallpaper.path" class="wallpaper-row" :style="{ position: 'absolute', top: (windowStart + index) * ROW_HEIGHT + 'px', left: 0, right: 0 }" :class="{ 'is-current': wallpaper.path === config.imagePath }" :data-pkg="sceneKey(wallpaper)" :data-cover="projectCoverSource(wallpaper)" :ref="registerThumb" @click="onSelectWallpaper(wallpaper)" @mouseenter="onPkgHover(sceneKey(wallpaper))" @contextmenu.prevent="onRowContextMenu($event, wallpaper.path)">
+                    <template v-if="projectCoverSource(wallpaper)">
+                        <img v-if="getProjectCover(projectCoverSource(wallpaper))" :src="getProjectCover(projectCoverSource(wallpaper))" :alt="wallpaper.title" class="wallpaper-preview" />
+                        <div v-else class="wallpaper-preview wallpaper-preview-empty"><el-icon><Picture /></el-icon></div>
+                    </template>
                     <video
-                        v-if="(wallpaper.mediaSource || wallpaper.preview) && isVideoPath(wallpaper.path) && !mediaFrames[imageKey(wallpaper)] && isThumbnailReady(mediaCacheKey(wallpaper))"
+                        v-else-if="(wallpaper.mediaSource || wallpaper.preview) && isVideoPath(wallpaper.path) && !mediaFrames[imageKey(wallpaper)] && isThumbnailReady(mediaCacheKey(wallpaper))"
                         :key="imageKey(wallpaper)"
                         :src="wallpaper.mediaSource || wallpaper.preview"
                         :data-video="imageKey(wallpaper)"
@@ -69,7 +73,7 @@
                         <el-icon v-else><Picture /></el-icon>
                     </div>
                     <img v-else-if="mediaFrames[imageKey(wallpaper)]" :src="mediaFrames[imageKey(wallpaper)]" :alt="wallpaper.title" class="wallpaper-preview" />
-                    <img v-else-if="wallpaper.preview && !isVideoPath(wallpaper.path) && isThumbnailReady(mediaCacheKey(wallpaper))" :src="wallpaper.preview" :alt="wallpaper.title" loading="lazy" class="wallpaper-preview" @load="captureImageThumb($event, imageKey(wallpaper))" />
+                    <img v-else-if="(wallpaper.mediaSource || wallpaper.preview) && !isVideoPath(wallpaper.path) && isThumbnailReady(mediaCacheKey(wallpaper))" :src="wallpaper.mediaSource || wallpaper.preview" :alt="wallpaper.title" loading="lazy" class="wallpaper-preview" @load="captureImageThumb($event, imageKey(wallpaper))" />
                     <div v-else class="wallpaper-preview wallpaper-preview-empty"><el-icon><Picture /></el-icon></div>
                     <div class="wallpaper-info">
                         <strong :title="wallpaper.title">{{ wallpaper.title }}</strong>
@@ -115,6 +119,7 @@ import { config, state } from '../composables/useStore';
 import { ActionType } from '../constants';
 import { isVideoPath, isWallpaperPkgPath } from '../utils/media';
 import { getThumbnail, setThumbnail, thumbnailView, ensureThumbnails, isThumbnailReady } from '../composables/useThumbnailCache';
+import { getProjectCover, requestProjectCover } from '../composables/useProjectCover';
 import { mediaPathKey } from '../../../src/mediaTypes';
 
 const { t } = useI18n();
@@ -226,6 +231,32 @@ const pkgLoading = reactive<Record<string, boolean>>({});
 const pkgErrors = reactive<Record<string, string>>({});
 const mediaFrames = thumbnailView(key => `${isVideoPath(key) ? 'video' : 'image'}:${key}`);
 
+/** Covers only affect Wallpaper list rows; original media/home caches remain intact. */
+const failedProjectCovers = reactive<Record<string, boolean>>({});
+const projectCoverJobs = new Map<string, AbortController>();
+function projectCoverSource(item: { preview?: string }): string {
+    const source = state.sourceMode === 'wallpaper' ? item.preview || '' : '';
+    return source && !failedProjectCovers[source] ? source : '';
+}
+function loadProjectCover(source: string): void {
+    if (!source || getProjectCover(source) || projectCoverJobs.has(source)) { return; }
+    const controller = new AbortController();
+    projectCoverJobs.set(source, controller);
+    void requestProjectCover(source, controller.signal).then(value => {
+        if (controller.signal.aborted) { return; }
+        if (!value) {
+            failedProjectCovers[source] = true;
+            const keys = Object.keys(failedProjectCovers);
+            if (keys.length > 600) { delete failedProjectCovers[keys[0]]; }
+            hydrateVideoThumbnails();
+            void nextTick(scanThumbs);
+        }
+    }).finally(() => {
+        if (projectCoverJobs.get(source) === controller) { projectCoverJobs.delete(source); }
+    });
+}
+
+
 /**
  * 抓取视频首帧做缩略图。
  *
@@ -306,7 +337,7 @@ function captureVideoFrame(event: Event, key: string) {
 
 /** 首帧缓存优先：命中就直接用，不再加载视频文件。 */
 function hydrateVideoThumbnails() {
-    void ensureThumbnails(visibleWallpapers.value.map(item => isWallpaperPkgPath(item.path) ? `scene:${sceneKey(item)}` : mediaCacheKey(item)));
+    void ensureThumbnails(visibleWallpapers.value.filter(item => !projectCoverSource(item)).map(item => isWallpaperPkgPath(item.path) ? `scene:${sceneKey(item)}` : mediaCacheKey(item)));
     visibleWallpapers.value.forEach(item => {
         const key = imageKey(item);
         if (mediaFrames[key]) { return; }
@@ -332,6 +363,7 @@ let reloadTimer: ReturnType<typeof setTimeout> | undefined;
 function onReloadWallpaperConfig() {
     if (reloadingConfig.value) { return; }
     reloadingConfig.value = true;
+    for (const source of Object.keys(failedProjectCovers)) { delete failedProjectCovers[source]; }
     bridge.post({ type: 'reloadWallpaperConfig' });
     // 扩展侧读盘 + 重建列表通常几十毫秒，这里给按钮一个最短展示时间，
     // 避免闪烁；同时兜底复位，防止消息丢失后按钮永久转圈。
@@ -421,6 +453,8 @@ function registerVideoThumb(el: any) {
 }
 
 function onPkgHover(display: string | undefined, priority = false) {
+    const item = visibleWallpapers.value.find(item => sceneKey(item) === display);
+    if (item && projectCoverSource(item)) { return; }
     if (!display || pkgFrames[display] || pkgErrors[display]) { return; }
     const cached = scenePreview.previewOf(display);
     if (cached) { pkgFrames[display] = cached; return; }
@@ -438,26 +472,41 @@ function onPkgHover(display: string | undefined, priority = false) {
 }
 
 let observer: IntersectionObserver | null = null;
+let coverObserver: IntersectionObserver | null = null;
 let observed = new WeakSet<Element>();
 
-function ensureObserver(): IntersectionObserver {
-    if (observer) { return observer; }
-    observer = new IntersectionObserver(entries => {
+function ensureObserver(coverOnly = false): IntersectionObserver {
+    const existing = coverOnly ? coverObserver : observer;
+    if (existing) { return existing; }
+    const created = new IntersectionObserver(entries => {
         entries.forEach(entry => {
             if (!entry.isIntersecting) { return; }
-            const display = (entry.target as HTMLElement).dataset.pkg || '';
-            observer?.unobserve(entry.target);
+            const node = entry.target as HTMLElement;
+            const cover = node.dataset.cover || '';
+            const display = node.dataset.pkg || '';
+            created.unobserve(entry.target);
             observed.delete(entry.target);
-            onPkgHover(display);
+            if (cover) { loadProjectCover(cover); }
+            else { onPkgHover(display); }
         });
-    }, { rootMargin: '120px' });
-    return observer;
+    }, { rootMargin: coverOnly ? '0px' : '120px' });
+    if (coverOnly) { coverObserver = created; }
+    else { observer = created; }
+    return created;
 }
 
-/** 模板 ref：只有带 data-pkg 的缩略图（即场景包）需要提前渲染。 */
+/** 封面进入可视区后加载；无可用封面时保留原场景预加载流程。 */
 function registerThumb(el: any) {
     const node = el as HTMLElement | null;
-    if (!node || !node.getClientRects().length || !node.dataset || !node.dataset.pkg) { return; }
+    if (!node || !node.dataset) { return; }
+    if (node.dataset.cover) {
+        if (!getProjectCover(node.dataset.cover) && !observed.has(node)) {
+            observed.add(node);
+            ensureObserver(true).observe(node);
+        }
+        return;
+    }
+    if (!node.getClientRects().length || !node.dataset.pkg) { return; }
     if (pkgFrames[node.dataset.pkg] || pkgErrors[node.dataset.pkg]) { return; }
     if (node.closest('.is-current')) {
         onPkgHover(node.dataset.pkg, true);
@@ -471,6 +520,7 @@ function registerThumb(el: any) {
 /** 列表/搜索变化后把新出现的缩略图纳入观察（重复 observe 是幂等的）。 */
 function scanThumbs() {
     document.querySelectorAll<HTMLElement>('.wallpaper-list [data-pkg]').forEach(node => {
+        if (node.dataset.cover) { registerThumb(node); return; }
         const display = node.dataset.pkg || '';
         if (!display) { return; }
         const cached = scenePreview.previewOf(display);
@@ -483,11 +533,16 @@ function scanThumbs() {
 }
 
 watch(visibleWallpapers, () => {
+    const covers = new Set(visibleWallpapers.value.map(projectCoverSource).filter(Boolean));
+    for (const [source, controller] of projectCoverJobs) {
+        if (!covers.has(source)) { controller.abort(); projectCoverJobs.delete(source); }
+    }
     // el-card 的 slot 可以单独更新而不触发本组件 onUpdated。
     // 列表异步到达后必须主动查缓存，否则视频一直停留在 isThumbnailReady=false。
     hydrateVideoThumbnails();
-    scenePreview.cancelQueuedExcept(new Set(visibleWallpapers.value.map(sceneKey).filter(Boolean)));
+    scenePreview.cancelQueuedExcept(new Set(visibleWallpapers.value.filter(item => !projectCoverSource(item)).map(sceneKey).filter(Boolean)));
     observer?.disconnect();
+    coverObserver?.disconnect();
     videoObserver?.disconnect();
     observed = new WeakSet();
     observedVideos = new WeakSet();
@@ -527,11 +582,15 @@ onUpdated(() => {
 });
 
 onUnmounted(() => {
+    projectCoverJobs.forEach(controller => controller.abort());
+    projectCoverJobs.clear();
     document.removeEventListener('visibilitychange', onGalleryVisibility);
     resizeObserver?.disconnect();
     scenePreview.cancelQueuedExcept(new Set());
     observer?.disconnect();
     observer = null;
+    coverObserver?.disconnect();
+    coverObserver = null;
     videoObserver?.disconnect();
     videoObserver = null;
     window.removeEventListener('pointerdown', onGlobalPointerDown, true);

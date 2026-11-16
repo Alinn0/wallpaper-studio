@@ -36,7 +36,7 @@ CSS/JS 生成、卸载还原思路均源自该项目）。当前版本已做了�
 
 ### WebWallGL
 
-- 版本：3.0.0
+- 版本：3.0.2
 - 版权：Copyright (c) 2026 oneincase <462534624@qq.com>
 - 许可证：MIT
 
