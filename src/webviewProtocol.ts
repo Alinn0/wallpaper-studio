@@ -53,8 +53,38 @@ export type WebviewMessage =
     | { type: 'openExternal'; url: string }
     | { type: 'resetAll' };
 
+function isRecord(value: unknown): value is Record<string, unknown> {
+    return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
 export function isWebviewMessage(value: unknown): value is WebviewMessage {
-    return typeof value === 'object'
-        && value !== null
-        && typeof (value as { type?: unknown }).type === 'string';
+    if (!isRecord(value)) { return false; }
+    const text = (key: string) => typeof value[key] === 'string';
+    const mode = () => ['file', 'folder', 'wallpaper'].includes(value.mode as string);
+    const hasValue = () => Object.prototype.hasOwnProperty.call(value, 'value');
+    switch (value.type) {
+        case 'ready': case 'refresh': case 'loadGallery':
+        case 'selectWallpaperConfig': case 'reloadWallpaperConfig':
+        case 'randomWallpaper': case 'previousWallpaper':
+        case 'scenePreviewPage': case 'resetAll': return true;
+        case 'runAction':
+            return Object.values(ActionType).includes(value.action as ActionTypeValue)
+                && (value.path === undefined || text('path'));
+        case 'setConfig': case 'setGlobalState': return text('key') && hasValue();
+        case 'saveDisplayFps':
+            return typeof value.maxFps === 'number' && Number.isFinite(value.maxFps)
+                && value.maxFps > 0 && typeof value.overwrite === 'boolean';
+        case 'setSourceMode': return mode();
+        case 'useWallpaper': case 'removeWallpaper': case 'revealInExplorer': return text('path');
+        case 'setWallpaperPinned': return text('path') && typeof value.pinned === 'boolean';
+        case 'removePlaylistItem': return text('path') && mode();
+        case 'setWallpaperProperty': return text('path') && text('key') && hasValue();
+        case 'setWallpaperProperties': return text('path') && isRecord(value.properties);
+        case 'cacheThumbnail': return text('key') && text('value');
+        case 'readThumbnails':
+            return Array.isArray(value.keys) && value.keys.every(key => typeof key === 'string')
+                && Number.isSafeInteger(value.requestId);
+        case 'openExternal': return text('url') && (value.url as string).toLowerCase().startsWith('https://');
+        default: return false;
+    }
 }

@@ -109,6 +109,13 @@ async function main() {
     {
         const events = [], messages = [], handlers = {}, mounts = [];
         const { document, nodes } = fakeDocument(events);
+        let decodePoster;
+        const createElement = document.createElement;
+        document.createElement = tag => {
+            const node = createElement(tag);
+            if (tag === 'img') node.decode = () => new Promise(resolve => { decodePoster = resolve; });
+            return node;
+        };
         const documentHandlers = {};
         document.addEventListener = (type, fn) => { documentHandlers[type] = fn; };
         let active = 0, maximum = 0;
@@ -135,6 +142,9 @@ async function main() {
             await waitFor(() => messages.some(message => message.type === 'scene-ready' && message.token === 'first'));
             events.length = 0;
             send({ type: 'load', token: 'second', bytes: new ArrayBuffer(2), key: 'B', targetFps: 240, maxFps: 144 });
+            await waitFor(() => !!decodePoster);
+            assert.ok(!events.includes('destroy'), 'old scene survives pending poster decode');
+            decodePoster();
             await waitFor(() => messages.some(message => message.type === 'scene-ready' && message.token === 'second'));
             assert.ok(events.indexOf('poster-added') < events.indexOf('destroy'), 'old frame must be covered before destruction');
             assert.equal(maximum, 1, 'no overlapping live GPU scenes');

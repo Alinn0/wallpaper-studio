@@ -304,7 +304,7 @@ const { extractBackgroundImageUrl } = require(path.join(REPO, 'out', 'loaderFrag
 
 // ---- 注入产物冒烟（A4/A5/A6 已编译进 out/）------------------------------------
 {
-    const fileDomJs = fs.readFileSync(path.join(REPO, 'out', 'workbenchRuntime.js'), 'utf-8');
+    const fileDomJs = require(path.join(REPO, 'out', 'workbenchRuntime')).createWorkbenchRuntime({});
     // 预加载函数名以字面量出现在 loader 模板里
     check('编译产物 workbenchRuntime.js 含预加载片段', fileDomJs.includes('preloadBackgroundImage'));
     check('编译产物 workbenchRuntime.js 含换图淡入淡出片段', fileDomJs.includes('bgcApplyStyleWithFade'));

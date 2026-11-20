@@ -73,7 +73,7 @@
                 <label>{{ t('blur') }}</label>
                 <el-slider v-model="config.blur" :min="0" :max="100" :step="1" @change="setGlobalConfig('blur', config.blur)" />
             </div>
-            <div class="global-setting fps-setting">
+            <div v-if="isWallpaperPkg" class="global-setting fps-setting">
                 <label>{{ t('targetFps') }} ({{ config.maxFps ? `${config.maxFps} Hz` : t(fpsReading ? 'fpsReading' : 'fpsNotRead') }})</label>
                 <div class="fps-controls">
                     <el-input-number :model-value="config.targetFps" :min="15" :max="refreshLimit"
@@ -85,11 +85,11 @@
                     </el-button>
                 </div>
             </div>
-            <div v-if="fpsReadFailed" class="fps-error" role="alert">{{ t('fpsReadFailed') }}</div>
+            <div v-if="isWallpaperPkg && fpsReadFailed" class="fps-error" role="alert">{{ t('fpsReadFailed') }}</div>
             <el-collapse v-model="settingsOpen">
                 <el-collapse-item name="wallpaper-properties">
                     <template #title><el-icon><Setting /></el-icon>{{ t('wallpaperPropertySettings') }}</template>
-                    <div v-if="properties.length" class="property-list">
+                    <div v-if="projectProperties.length" class="property-list">
                         <template v-for="property in projectProperties" :key="property.key">
                             <div v-if="property.type === 'group'" class="property-group">{{ property.text }}</div>
                             <div v-else-if="property.type === 'header'" class="property-header">{{ property.text }}</div>
@@ -223,7 +223,8 @@ const properties = computed<WallpaperProperty[]>(() => {
 const VIEW_PROPERTY_KEYS = new Set(['wallpaperstudio_pan_x', 'wallpaperstudio_pan_y']);
 
 const projectProperties = computed<WallpaperProperty[]>(() =>
-    properties.value.filter(property => !VIEW_PROPERTY_KEYS.has(property.key))
+    // Only the scene renderer consumes project-defined properties. Images and videos use X/Y below.
+    isWallpaperPkg.value ? properties.value.filter(property => !VIEW_PROPERTY_KEYS.has(property.key)) : []
 );
 
 /** 当前壁纸的标识：用它判断"换壁纸了"，比路径比较更稳（大小写/斜杠差异）。 */
@@ -381,7 +382,7 @@ function setGlobalConfig(key: 'opacity' | 'blur', value: number) {
 }
 function updateWallpaperProperty(key: string, value: unknown, wallpaperPath = config.imagePath) {
     if (!wallpaperPath) { return; }
-    bridge.post({ type: 'setWallpaperProperty', path: wallpaperPath, key, value });
+    bridge.post({ type: 'setWallpaperProperties', path: wallpaperPath, properties: { [key]: value } });
 }
 
 function isHexColor(value: unknown): boolean {

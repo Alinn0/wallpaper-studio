@@ -86,6 +86,10 @@ export const onDidChangeExternalSettings: Event<string[]> = externalChangeEmitte
 export const onDidChangeSettings: Event<string[]> = changeEmitter.event;
 
 function coerce<K extends keyof AppSettings>(key: K, value: unknown): AppSettings[K] | undefined {
+    // Keep the legacy key readable, but always follow the editor theme globally.
+    if (key === 'blendModel') { return 'auto' as AppSettings[K]; }
+    // Background identity is always the opened folder; retire the shared-CSS mode.
+    if (key === 'perWindowBackground') { return true as AppSettings[K]; }
     if (NUMERIC_KEYS.has(key as string)) {
         const num = typeof value === 'number' ? value : Number(value);
         if (key === 'maxFps') { return (Number.isFinite(num) && (num === 0 || num >= 15) ? Math.round(num) : undefined) as AppSettings[K] | undefined; }

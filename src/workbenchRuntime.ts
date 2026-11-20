@@ -1,3 +1,4 @@
+import { MEDIA_HANDOFF_JS } from './mediaHandoff';
 import { IMAGE_FADE_JS, PRELOAD_IMAGE_JS } from './loaderFragments';
 import { SCENE_CONTINUITY_JS } from './sceneContinuity';
 
@@ -16,214 +17,7 @@ interface RuntimeOptions {
 export function createWorkbenchRuntime(options: RuntimeOptions): string {
     const { escapedDesktopUrl, webCssPath, cssFileName, workbenchJsName, relativePlaceholder, bootstrapCssFileName, perWindowBackground, sharedCssToken } = options;
 
-        const videoSetup = `
-            function applyVideo(targetWindow, config) {
-                try {
-                    const doc = targetWindow && targetWindow.document;
-                    if (!doc || !doc.body) return;
-                    let video = doc.getElementById('wallpaper-studio-video');
-                    if (!config) {
-                        if (video) {
-                            if (video.__bgcTransfer) { video.__bgcTransfer.abort(); }
-                            if (video.__bgcObjectUrl) {
-                                try { URL.revokeObjectURL(video.__bgcObjectUrl); } catch (e) {}
-                            }
-                            // 清空"目标地址"，正在进行的 blob 转换回来后会自行丢弃。
-                            video.__bgcWantedUrl = null;
-                            video.__bgcFetchingFor = null;
-                            video.remove();
-                        }
-                        return;
-                    }
-                    if (!video) {
-                        video = doc.createElement('video');
-                        video.id = 'wallpaper-studio-video';
-                        video.autoplay = true;
-                        video.loop = true;
-                        video.muted = true;
-                        video.playsInline = true;
-                        video.preload = 'auto';
-                        video.style.position = 'absolute';
-                        video.style.top = '0';
-                        video.style.left = '0';
-                        video.style.width = '100%';
-                        video.style.height = '100%';
-                        video.style.objectFit = 'cover';
-                        video.style.zIndex = '2';
-                        video.style.pointerEvents = 'none';
-                        doc.body.prepend(video);
-                    } else if (!video.isConnected) {
-                        // 某些工作台布局重建会把节点摘掉，重新挂回 body。
-                        doc.body.prepend(video);
-                    }
-
-                    let url = config.url;
-                    const loc = targetWindow.location;
-                    if (loc && url.toLowerCase().startsWith('http://') && loc.protocol === 'https:') {
-                        url = url.replace(/^http:\\/\\//i, 'https://');
-                    }
-
-                    if (!video.loop) video.loop = true;
-                    if (!video.muted) video.muted = true;
-
-                    video.style.objectPosition = config.position || 'center';
-                    video.style.objectFit = config.fit || 'cover';
-                    video.style.opacity = config.opacity + '';
-                    video.style.filter = 'blur(' + config.blur + 'px)';
-                    video.style.mixBlendMode = config.blendMode;
-
-                    if (video.__bgcTransfer && video.__bgcWantedUrl !== url) { video.__bgcTransfer.abort(); }
-                    if (/^wss?:/i.test(url)) {
-                        if (video.__bgcWantedUrl === url) { return; }
-                        video.__bgcWantedUrl = url;
-                        const transfer = new AbortController();
-                        video.__bgcTransfer = transfer;
-                        readWallpaperBytes(targetWindow, url, transfer.signal).then(function(bytes) {
-                            if (video.__bgcWantedUrl !== url || transfer.signal.aborted) return;
-                            const mime = new URL(url).searchParams.get('mime') || 'video/mp4';
-                            const next = URL.createObjectURL(new Blob([bytes], { type: mime }));
-                            if (video.__bgcObjectUrl) URL.revokeObjectURL(video.__bgcObjectUrl);
-                            video.__bgcObjectUrl = next;
-                            video.src = next;
-                            video.play().catch(function() {});
-                        }).catch(function(error) {
-                            if (video.__bgcWantedUrl === url && !transfer.signal.aborted) {
-                                video.__bgcWantedUrl = null;
-                                console.error('[WallpaperStudio] Video transfer failed:', error);
-                            }
-                        });
-                        return;
-                    }
-
-                    // A6: 视频切换同样支持淡入淡出（尊重系统"减少动态效果"）
-                    if (config.transition) {
-                        var reducedMotion = (typeof matchMedia === 'function' && matchMedia('(prefers-reduced-motion: reduce)').matches);
-                        video.style.transition = reducedMotion ? 'none' : 'opacity .25s ease, filter .25s ease';
-                    }
-
-                    // B1: vscode-file 协议由 main.js 的 net.fetch(file://) 代理，Electron 43
-                    // 起不再补 Accept-Ranges/206，Chromium 150 的 <video> 直接报
-                    // "no supported sources"。把 vscode-file 的视频 fetch 成完整 blob
-                    // 再用 object URL 播放，绕开协议层对 Range 的依赖。
-                    //
-                    // 但大文件（4K 视频动辄几百 MB）fetch 要好几秒，期间画面是空的 ——
-                    // 这就是"概率不显示"的来源。所以改成：
-                    //   1) 先直连，立即尝试播放；
-                    //   2) 后台转 blob，成功后无缝替换（保留播放进度）；
-                    //   3) 直连已经能播时跳过 blob，避免重复读盘与内存翻倍。
-                    if (url.toLowerCase().startsWith('vscode-file:')) {
-                        // 记录「本次应该播放的地址」。fetch 是异步的，期间用户可能已经
-                        // 切到别的壁纸；回来时必须确认自己仍是当前目标，否则会把新壁纸
-                        // 的 src 覆盖成旧视频。
-                        video.__bgcWantedUrl = url;
-
-                        if (video.__bgcBlobFor === url && video.__bgcObjectUrl) {
-                            if (video.src !== video.__bgcObjectUrl) {
-                                video.src = video.__bgcObjectUrl;
-                            }
-                            if (video.paused) {
-                                video.play().catch(function() {});
-                            }
-                            return;
-                        }
-
-                        var switched = video.__bgcSourceUrl !== url;
-                        if (switched) {
-                            video.__bgcSourceUrl = url;
-                            video.__bgcBlobFor = null;
-                            video.src = url;
-                        }
-                        if (video.paused) {
-                            video.play().catch(function(e) {
-                                if (e.name !== 'AbortError') {
-                                    console.error('WallpaperStudio video play error:', e);
-                                }
-                            });
-                        }
-
-                        if (video.__bgcFetchingFor === url) { return; }
-                        video.__bgcFetchingFor = url;
-                        var scheduleBlob = function(delay) {
-                            setTimeout(function() {
-                                if (video.__bgcWantedUrl !== url) { video.__bgcFetchingFor = null; return; }
-                                // 直连已经能在播：不再重复读整段视频。
-                                if (video.readyState >= 2 && !video.error) {
-                                    video.__bgcFetchingFor = null;
-                                    return;
-                                }
-                                fetch(url).then(function(r) {
-                                    if (!r.ok) throw new Error('vscode-file fetch failed: ' + r.status);
-                                    return r.blob();
-                                }).then(function(blob) {
-                                    video.__bgcFetchingFor = null;
-                                    if (video.__bgcWantedUrl !== url) { return; }
-                                    var nextUrl = URL.createObjectURL(blob);
-                                    var prevObj = video.__bgcObjectUrl;
-                                    var resumeAt = video.currentTime;
-                                    video.__bgcObjectUrl = nextUrl;
-                                    video.__bgcBlobFor = url;
-                                    video.__bgcSourceUrl = url;
-                                    video.src = nextUrl;
-                                    if (resumeAt > 0.2) {
-                                        var restore = function() {
-                                            try { video.currentTime = resumeAt; } catch (e) {}
-                                            video.play().catch(function() {});
-                                        };
-                                        video.addEventListener('loadedmetadata', restore, { once: true });
-                                    }
-                                    video.play().catch(function() {});
-                                    if (prevObj) {
-                                        try { URL.revokeObjectURL(prevObj); } catch (e) {}
-                                    }
-                                }).catch(function(e) {
-                                    video.__bgcFetchingFor = null;
-                                    if (video.__bgcWantedUrl !== url) { return; }
-                                    // 直连已经在播就不用管；否则说明两种方式都不行。
-                                    if (video.readyState < 2) {
-                                        console.error('WallpaperStudio video blob load error:', e);
-                                    }
-                                });
-                            }, delay);
-                        };
-                        scheduleBlob(switched ? 1200 : 0);
-                        return;
-                    }
-
-                    let currentSrc = video.src;
-                    let newSrc = url;
-                    try {
-                        if (currentSrc !== newSrc && decodeURIComponent(currentSrc) !== decodeURIComponent(newSrc)) {
-                            // 从 blob 切回直链时，回收旧的 object URL。
-                            if (video.__bgcObjectUrl) {
-                                try { URL.revokeObjectURL(video.__bgcObjectUrl); } catch (e) {}
-                                video.__bgcObjectUrl = null;
-                                video.__bgcSourceUrl = null;
-                            }
-                            video.src = newSrc;
-                        }
-                    } catch (e) {
-                        if (currentSrc !== newSrc) {
-                            if (video.__bgcObjectUrl) {
-                                try { URL.revokeObjectURL(video.__bgcObjectUrl); } catch (e) {}
-                                video.__bgcObjectUrl = null;
-                                video.__bgcSourceUrl = null;
-                            }
-                            video.src = newSrc;
-                        }
-                    }
-
-                    if (video.paused) {
-                        video.play().catch(e => {
-                            if (e.name !== 'AbortError') {
-                                console.error('WallpaperStudio video play error:', e);
-                            }
-                        });
-                    }
-                } catch (e) {
-                    console.error('[WallpaperStudio] applyVideo error:', e);
-                }
-            }
-        `;
+        const videoSetup = MEDIA_HANDOFF_JS;
 
         return `
         (function() {
@@ -475,7 +269,7 @@ export function createWorkbenchRuntime(options: RuntimeOptions): string {
             const sceneRendererUrl = (() => {
                 const url = new URL('./wallpaper-studio-scene.html', import.meta.url);
                 url.searchParams.set('resources', 'native');
-                url.searchParams.set('runtime', 'continuity-20261107');
+                url.searchParams.set('runtime', 'handoff-20261120');
                 return url.toString();
             })();
 
@@ -631,6 +425,7 @@ export function createWorkbenchRuntime(options: RuntimeOptions): string {
                     }
                 }).catch(function(error) {
                     if (targetWindow.__wallpaperStudioSceneState === state && state.generation === generation) {
+                        if (state.onError) state.onError(error);
                         notifyWallpaperRender(targetWindow, state.config, 'error', error.message);
                         state.loading = false;
                         console.error('[WallpaperStudio] Scene package load failed:', error);
@@ -638,7 +433,7 @@ export function createWorkbenchRuntime(options: RuntimeOptions): string {
                 });
             }
 
-            function applyScene(targetWindow, config) {
+            function applyScene(targetWindow, config, onReady, onError) {
                 try {
                     const doc = targetWindow && targetWindow.document;
                     if (!doc || !doc.body) return;
@@ -686,6 +481,7 @@ export function createWorkbenchRuntime(options: RuntimeOptions): string {
                             }
                             if (message.token !== state.token) return;
                             if (message.type === 'scene-ready') {
+                                if (state.onReady) state.onReady();
                                 notifyWallpaperRender(targetWindow, state.config, 'ready');
                                 state.loading = false;
                                 state.ready = true;
@@ -697,6 +493,7 @@ export function createWorkbenchRuntime(options: RuntimeOptions): string {
                                 recordWallpaperTiming(targetWindow, 'renderer-switch-ready', performance.now() - state.requestedAt);
                                 frame.contentWindow.postMessage({ type: 'set-properties', properties: state.config.properties || {}, targetFps: state.config.targetFps, maxFps: state.config.maxFps }, '*');
                             } else if (message.type === 'scene-error') {
+                                if (state.onError) state.onError(new Error(message.message));
                                 notifyWallpaperRender(targetWindow, state.config, 'error', message.message);
                                 state.loading = false;
                                 state.ready = false;
@@ -711,6 +508,8 @@ export function createWorkbenchRuntime(options: RuntimeOptions): string {
                         showWallpaperPoster(targetWindow, activeCssUrl(), config);
                     }
 
+                    state.onReady = onReady;
+                    state.onError = onError;
                     state.frame.title = config.title || 'Wallpaper Engine scene';
                     state.frame.style.opacity = String(config.opacity);
                     state.frame.style.filter = 'blur(' + config.blur + 'px)';
@@ -719,6 +518,7 @@ export function createWorkbenchRuntime(options: RuntimeOptions): string {
                         // 记住最新配置，后续 applyToAll（窗口增删/主题切换）要用新值重建。
                         state.config = config;
                         if (state.ready && state.frame && state.frame.contentWindow) {
+                            if (state.onReady) state.onReady();
                             notifyWallpaperRender(targetWindow, config, 'ready');
                             state.frame.contentWindow.postMessage({
                                 type: 'set-properties',
@@ -796,9 +596,7 @@ export function createWorkbenchRuntime(options: RuntimeOptions): string {
                 } catch (e) {
                     // Auxiliary windows may not allow property writes during init.
                 }
-                applyStyle(w, lastCss);
-                applyVideo(w, lastVideoConfig);
-                applyScene(w, lastSceneConfig);
+                applyWallpaperHandoff(w, lastCss, lastVideoConfig, lastSceneConfig);
             }
 
             function applyToAll() {
@@ -906,7 +704,6 @@ export function createWorkbenchRuntime(options: RuntimeOptions): string {
                 lastCssLoadAt = Date.now();
                 const currentCssUrl = activeCssUrl();
                 const url = forceFresh ? withCacheBust(currentCssUrl) : currentCssUrl;
-                const hadCss = !!lastCss;
                 fetch(url).then(r => {
                     if (!r.ok) throw new Error('Background CSS read failed: ' + r.status);
                     return r.text();
@@ -942,9 +739,7 @@ export function createWorkbenchRuntime(options: RuntimeOptions): string {
                         lastSceneConfig = null;
                     }
 
-                    // The first background has no old layer to cross-fade from.
-                    // Do not make the initial render wait for the preload timeout.
-                    return hadCss ? preloadBackgroundImage(resolvedCss) : undefined;
+                    return undefined; // Each window preloads and commits its own replacement.
                 }).then(() => {
                     applyToAll();
                 }).catch(e => console.error('[WallpaperStudio] Load error:', e))

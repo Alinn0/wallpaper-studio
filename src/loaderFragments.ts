@@ -27,37 +27,28 @@ export function extractBackgroundImageUrl(css: string): string {
     return match && match[1] ? match[1] : '';
 }
 
-/**
- * 注入到 loader 的预加载函数（只用单引号/字符串拼接，避免与外部模板字面量冲突）。
- * 阻塞换图的最长时间 2000ms：正常图片（本地缓存/较快网络）几乎瞬间完成，
- * 损坏或不可达的图片也不会让背景永远不更新。
- */
+/** Decode before committing; errors/timeouts retain the old media. */
 export const PRELOAD_IMAGE_JS = `
 function preloadBackgroundImage(css) {
-    try {
-        if (typeof Image === 'undefined') { return Promise.resolve(); }
-        var m = new RegExp("${BACKGROUND_IMAGE_URL_REGEX_EMBEDDED}", "i").exec(css);
-        if (!m || !m[1]) { return Promise.resolve(); }
-        var url = m[1];
-        if (url.indexOf('data:') === 0) { return Promise.resolve(); }
-        return new Promise(function (resolve) {
-            var done = false;
-            var timer = null;
-            var finish = function () {
-                if (done) { return; }
-                done = true;
-                if (timer) { clearTimeout(timer); }
-                resolve();
-            };
-            timer = setTimeout(finish, 2000);
-            var img = new Image();
-            img.onload = finish;
-            img.onerror = finish;
-            img.src = url;
-        });
-    } catch (e) {
-        return Promise.resolve();
-    }
+    var m = new RegExp("${BACKGROUND_IMAGE_URL_REGEX_EMBEDDED}", "i").exec(css);
+    if (!m || !m[1]) return Promise.resolve();
+    return new Promise(function(resolve, reject) {
+        var image = new Image();
+        var done = false;
+        var timer = setTimeout(function() { finish(new Error('Wallpaper image decode timed out')); }, 15000);
+        function finish(error) {
+            if (done) return;
+            done = true; clearTimeout(timer);
+            image.onload = image.onerror = null;
+            if (error) { image.src = ''; reject(error); } else resolve();
+        }
+        image.onload = function() {
+            if (image.decode) image.decode().then(function() { finish(); }, finish);
+            else finish();
+        };
+        image.onerror = function() { finish(new Error('Wallpaper image load failed')); };
+        image.src = m[1];
+    });
 }
 `;
 
@@ -138,7 +129,7 @@ function bgcApplyStyleWithFade(targetWindow, style, css) {
         // 首次应用/未换图/减少动态效果/视频无背景图 → 直接应用
         if (!imageChanged || bgcShouldReduceMotion() || !lastUrl || !url) {
             style.textContent = css;
-            if (url) { targetWindow.__bgcLastImageUrl = url; }
+            targetWindow.__bgcLastImageUrl = url || ''; // A video/scene has no image layer to fade out.
             return;
         }
         var beforeRule = bgcExtractBeforeRule(css);

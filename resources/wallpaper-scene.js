@@ -66,8 +66,8 @@
     let posterTimer;
     let mountChain = Promise.resolve();
 
-    function showPoster(value) {
-        if (!value) return;
+    async function showPoster(value) {
+        if (!value) throw new Error("Previous scene snapshot unavailable");
         if (posterTimer) clearTimeout(posterTimer);
         if (!poster) {
             poster = document.createElement('img');
@@ -78,6 +78,15 @@
         poster.style.transition = 'none';
         poster.style.opacity = '1';
         poster.src = value;
+        if (poster.decode) {
+            let deadline;
+            try {
+                await Promise.race([poster.decode(), new Promise(function(_, reject) {
+                    deadline = setTimeout(function() { reject(new Error('Scene snapshot decode timed out')); }, 3000);
+                })]);
+            } finally { clearTimeout(deadline); }
+        }
+        await nextPaint();
     }
 
     function dismissPoster(expectedGeneration) {
@@ -104,6 +113,16 @@
         const context = thumb.getContext('2d');
         if (!context) return '';
         context.drawImage(canvas, 0, 0, size.width, size.height);
+        // A WebGL drawing buffer can be cleared after composition. JPEG would turn
+        // that transparent capture into an apparently valid solid black poster.
+        if (context.getImageData) {
+            const pixels = context.getImageData(0, 0, size.width, size.height).data;
+            let hasPixels = false;
+            for (let i = 3; i < pixels.length; i += 4) {
+                if (pixels[i] > 0) { hasPixels = true; break; }
+            }
+            if (!hasPixels) return '';
+        }
         return thumb.toDataURL('image/jpeg', 0.8);
     }
 
@@ -217,6 +236,12 @@
             return;
         }
         if (typeof message.token !== 'string') return;
+        if (message.type === 'cancel-load' && message.token === token) {
+            generation++;
+            if (posterTimer) clearTimeout(posterTimer);
+            if (poster) { poster.style.transition = 'none'; poster.style.opacity = '1'; }
+            return;
+        }
         if (message.type === 'dispose' && message.token === token) {
             generation++;
             if (scene) {
@@ -247,10 +272,15 @@
         capturing = !!message.capture;
         targetFps = Number.isFinite(message.targetFps) ? Math.max(15, Math.round(message.targetFps)) : 60;
         displayFps = Number.isFinite(message.maxFps) && message.maxFps >= 15 ? Math.round(message.maxFps) : 60;
-        if (!message.capture) {
+        if (!message.capture && scene) {
             let snapshot = lastPoster;
             try { snapshot = capturePoster() || snapshot; } catch (e) { /* Preserve the previous cached frame. */ }
-            showPoster(snapshot);
+            try { await showPoster(snapshot); }
+            catch (error) {
+                if (currentGeneration === generation) parent.postMessage({ type: 'scene-error', token: message.token, message: error.message }, '*');
+                return; // Never destroy the last live scene without a decoded cover.
+            }
+            if (currentGeneration !== generation) return;
         }
         if (scene) {
             scene.destroy({ releasePkgCache: true });
@@ -297,7 +327,13 @@
             await nextPaint();
             if (currentGeneration !== generation) return;
             let firstPoster = '';
-            try { firstPoster = capturePoster(); } catch (e) { /* Readback is optional. */ }
+            // Wait for actual pixels, not just an animation callback before GL draws.
+            for (let attempt = 0; attempt < 120 && !firstPoster; attempt++) {
+                if (currentGeneration !== generation) return;
+                try { firstPoster = capturePoster(); } catch (e) { /* Retry until a rendered frame exists. */ }
+                if (!firstPoster) await nextPaint();
+            }
+            if (!firstPoster) throw new Error('Scene did not produce a readable first frame');
             if (firstPoster) lastPoster = firstPoster;
             parent.postMessage({ type: 'scene-ready', token: token, poster: firstPoster,
                 mountMs: performance.now() - startedAt }, '*');

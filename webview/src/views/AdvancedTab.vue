@@ -33,27 +33,8 @@
 
         </el-card>
 
-        <!-- Window scope -->
-        <el-card class="card" shadow="never">
-            <template #header>
-                <span class="card-title">
-                    <el-icon><Monitor /></el-icon>
-                    {{ t('windowScope') }}
-                </span>
-            </template>
-
-            <div class="row">
-                <span class="row-label">{{ t('perWindowBackground') }}</span>
-                <el-switch
-                    :model-value="config.perWindowBackground !== false"
-                    @change="(v: any) => bridge.post({ type: 'setConfig', key: 'perWindowBackground', value: v })"
-                />
-            </div>
-            <div class="row-hint">{{ t('perWindowBackgroundHint') }}</div>
-        </el-card>
-
-        <!-- Size mode -->
-        <el-card class="card" shadow="never">
+        <!-- Scene rendering always uses cover; size modes only apply to images/videos. -->
+        <el-card v-if="!isScene" class="card" shadow="never">
             <template #header>
                 <span class="card-title">
                     <el-icon><FullScreen /></el-icon>
@@ -61,32 +42,13 @@
                 </span>
             </template>
             <el-select
-                :model-value="config.sizeModel"
+                :model-value="displaySizeMode"
                 size="small"
                 class="block-select"
                 @change="(v: any) => bridge.post({ type: 'setConfig', key: 'sizeModel', value: v })"
             >
                 <el-option v-for="opt in sizeModeOptions" :key="opt.value" :label="opt.label" :value="opt.value" />
             </el-select>
-        </el-card>
-
-        <!-- Blend mode -->
-        <el-card class="card" shadow="never">
-            <template #header>
-                <span class="card-title">
-                    <el-icon><Brush /></el-icon>
-                    {{ t('blendMode') }}
-                </span>
-            </template>
-            <el-select
-                :model-value="config.blendModel"
-                size="small"
-                class="block-select"
-                @change="(v: any) => bridge.post({ type: 'setConfig', key: 'blendModel', value: v })"
-            >
-                <el-option v-for="opt in blendModeOptions" :key="opt.value" :label="opt.label" :value="opt.value" />
-            </el-select>
-            <div class="row-hint">{{ t('blendModeHint') }}</div>
         </el-card>
 
         <!-- Misc -->
@@ -114,12 +76,13 @@
 
 <script setup lang="ts">
 import { computed, onUnmounted, ref } from 'vue';
-import { Refresh, FullScreen, Brush, FolderOpened, Monitor, Delete } from '@element-plus/icons-vue';
+import { Refresh, FullScreen, FolderOpened, Delete } from '@element-plus/icons-vue';
 import { useI18n, type MessageKey } from '../composables/useI18n';
 import { useBridge } from '../composables/useBridge';
 import { useDebouncedPost } from '../composables/useDebouncedPost';
 import { config } from '../composables/useStore';
-import { ActionType, SIZE_MODES, BLEND_MODES } from '../constants';
+import { isVideoPath, isWallpaperPkgPath } from '../utils/media';
+import { ActionType, SIZE_MODES } from '../constants';
 
 const { t } = useI18n();
 const bridge = useBridge();
@@ -138,11 +101,6 @@ const SIZE_MODE_LABEL_KEYS: Record<string, MessageKey> = {
     not_top:          'sizeModeNotTop',
     not_bottom:       'sizeModeNotBottom'
 };
-const BLEND_MODE_LABEL_KEYS: Record<string, MessageKey> = {
-    auto:     'blendModeAuto',
-    multiply: 'blendModeMultiply',
-    lighten:  'blendModeLighten'
-};
 
 const intervalPost = useDebouncedPost('setConfig', 'autoInterval', { delay: 300 });
 function onIntervalChange(v: number | undefined) {
@@ -152,13 +110,15 @@ function onIntervalChange(v: number | undefined) {
 }
 
 
-const sizeModeOptions = computed(() => SIZE_MODES.map((value) => ({
+const isScene = computed(() => isWallpaperPkgPath(config.imagePath));
+const isVideo = computed(() => isVideoPath(config.imagePath));
+// Match FileDom's video fit fallback without overwriting the saved image preference.
+const displaySizeMode = computed(() => isVideo.value
+    ? (config.sizeModel === 'contain' ? 'contain' : 'cover')
+    : config.sizeModel);
+const sizeModeOptions = computed(() => (isVideo.value ? ['cover', 'contain'] : SIZE_MODES).map((value) => ({
     value,
-    label: t(SIZE_MODE_LABEL_KEYS[value] ?? 'sizeModeCover')
-})));
-const blendModeOptions = computed(() => BLEND_MODES.map((value) => ({
-    value,
-    label: t(BLEND_MODE_LABEL_KEYS[value] ?? 'blendModeAuto')
+    label: t(isVideo.value && value === 'contain' ? 'sizeModeFit' : (SIZE_MODE_LABEL_KEYS[value] ?? 'sizeModeCover'))
 })));
 
 function onOpenCache()    { bridge.post({ type: 'runAction', action: ActionType.OpenCacheFolder }); }

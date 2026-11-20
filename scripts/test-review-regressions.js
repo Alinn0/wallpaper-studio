@@ -261,7 +261,7 @@ async function main() {
         box.onPropertySliderInput(property); box.onViewOffsetInput();
         property.value = 2; box.config.imagePath = 'B.pkg'; box.cameraPanX.value = 100;
         timers.forEach(callback => callback());
-        assert.equal(messages[0].path, 'A.pkg'); assert.equal(messages[0].value, 9);
+        assert.equal(messages[0].path, 'A.pkg'); assert.equal(messages[0].type, 'setWallpaperProperties'); assert.equal(messages[0].properties.speed, 9);
         assert.equal(messages[1].path, 'A.pkg'); assert.equal(messages[1].properties.wallpaperstudio_pan_x, 20);
     });
 

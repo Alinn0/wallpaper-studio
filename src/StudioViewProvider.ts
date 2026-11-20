@@ -42,7 +42,6 @@ import {
     rememberWallpaperPlaylist,
     forgetWallpaperPlaylist,
     getWallpaperPropertyOverrides,
-    setWallpaperProperty,
     setWallpaperProperties
 } from './wallpaperEngine';
 import { clearWallpaperProjectCache, WALLPAPER_USER_KEY } from './wallpaperEngine';
@@ -52,7 +51,6 @@ import {
     DEFAULT_SOURCE_MODE,
     SourceMode,
     getCandidatesForMode,
-    getRandomCandidates,
     normalizeSourceMode,
     setSourceMode,
     getLocalFiles,
@@ -803,22 +801,10 @@ export class StudioViewProvider implements WebviewViewProvider {
                 return;
             }
 
-            case 'randomWallpaper': {
-                // 随机换一张时用来排除当前壁纸，同样要读真正生效的路径。
-                const current = getPendingBackgroundSelection(getWorkspaceKey()) ?? resolveCurrentImagePath(
-                    getAppConfig().get<string>('imagePath') || ''
-                );
-                // 只在当前模式内抽，并排除当前这张。
-                const pool = getRandomCandidates(current);
-                if (!pool.length) {
-                    this.toast('当前模式没有可用的壁纸', 'warning');
-                    return;
-                }
-                const next = pool[Math.floor(Math.random() * pool.length)];
-                await commands.executeCommand('wallpaperStudio.setConfig', 'wallpaperStudio.imagePath', next);
+            case 'randomWallpaper':
+                await PickList.randomUpdateBackground();
                 this.pushState();
                 return;
-            }
 
             case 'previousWallpaper': {
                 const next = getPreviousImagePath();
@@ -849,11 +835,7 @@ export class StudioViewProvider implements WebviewViewProvider {
                 return;
 
             case 'removeWallpaper':
-                if (typeof msg.path === 'string') {
-                    await removeWallpaper(this.ctx.globalState, msg.path);
-                    await this.syncWallpaperPlaylist();
-                    this.pushState();
-                }
+                await this.handleMessage({ type: 'removePlaylistItem', path: msg.path, mode: 'wallpaper' });
                 return;
 
             case 'removePlaylistItem':
@@ -897,8 +879,7 @@ export class StudioViewProvider implements WebviewViewProvider {
 
             case 'setWallpaperProperty':
                 if (typeof msg.path === 'string' && typeof msg.key === 'string') {
-                    await setWallpaperProperty(this.ctx.globalState, msg.path, msg.key, msg.value);
-                    this.scheduleWallpaperPropertyApply(msg.path);
+                    await this.handleMessage({ type: 'setWallpaperProperties', path: msg.path, properties: { [msg.key]: msg.value } });
                 }
                 return;
 

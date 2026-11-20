@@ -50,6 +50,30 @@
             "detail": "完整编译安装流程内联于此任务：打包至 releases/current，成功后覆盖安装。可从 Task Explorer 或 Ctrl+Shift+B 直接运行。"
         },
         {
+            "label": "一键编译并发布插件（版本号自增）",
+            "type": "process",
+            "command": "node",
+            "args": [
+                "scripts/publish-extension.cjs"
+            ],
+            "options": {
+                "cwd": "${workspaceFolder}"
+            },
+            "problemMatcher": [
+                "$tsc"
+            ],
+            "group": "build",
+            "runOptions": {
+                "instanceLimit": 1
+            },
+            "presentation": {
+                "reveal": "always",
+                "panel": "dedicated",
+                "clear": true
+            },
+            "detail": "先检查代码已提交、远程可推送及商店凭据，再编译、递增 patch 并发布至扩展商店；成功后自动提交版本号并推送当前分支到远程上游。缺少授权时显示配置步骤。"
+        },
+        {
             "label": "npm: watch",
             "type": "shell",
             "command": "npm",
