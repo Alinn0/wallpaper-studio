@@ -2,7 +2,7 @@
   "name": "wallpaper-studio",
   "displayName": "Wallpaper Studio",
   "description": "Render images, videos and Wallpaper Engine scene packages as your VS Code background. / 用图片、视频与 Wallpaper Engine 场景包作为 VS Code 背景。",
-  "version": "1.0.2",
+  "version": "1.0.3",
   "publisher": "Alin0907",
   "engines": {
     "vscode": "^1.60.0"
